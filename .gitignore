@@ -1,0 +1,17 @@
+# 本地账户、API 配置与作品
+/data/
+/qa-data/
+/work/
+/outputs/
+*.sqlite*
+*.db
+*.db-*
+provider-settings*
+.env
+.env.*
+
+# 缓存与运行日志
+__pycache__/
+*.py[cod]
+*.log
+*.pid
