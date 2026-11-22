@@ -1,26 +1,33 @@
 """同源网页与JSON接口；私有文件从不通过静态目录提供。"""
 
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from http.cookies import SimpleCookie, CookieError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit, unquote
+from urllib.parse import parse_qs, urlsplit, unquote
 import ipaddress
 import json
 import logging
 import mimetypes
+import os
+import re
+import socket
 import threading
 import time
 
 from .contracts import COOKIE_NAME, DomainError, PROJECT_ROOT, SESSION_SECONDS, data_identity
 from .jobs import JobManager
 from .instance import InstanceLock
-from .plans import DEFAULT_ANSWERS, build_prompt, build_summary, missing_fields, sanitize_answers
+from .plans import DEFAULT_ANSWERS, build_prompt, build_preview, sanitize_answers
 from .provider import Provider
 from .secrets import SecretSettings
 from .store import Store
 
 LOGGER = logging.getLogger("creation.web")
+FILE_CHUNK_BYTES = 64 * 1024
+REJECTED_BODY_DRAIN_BYTES = 128 * 1024
+REJECTED_BODY_DRAIN_SECONDS = 0.1
 
 
 class RateLimiter:
@@ -64,7 +71,18 @@ class Application:
         self.public_url = public_url.rstrip("/")
         self.test_mode = test_mode
         self.limiter = RateLimiter()
-        self.auth_slots = threading.BoundedSemaphore(4)
+        # 两核服务器只同时运行两次 scrypt，排队不额外分配密码计算内存。
+        self.auth_slots = threading.BoundedSemaphore(2)
+        self.auth_wait_seconds = 10
+
+    @contextmanager
+    def password_work(self):
+        if not self.auth_slots.acquire(timeout=self.auth_wait_seconds):
+            raise DomainError(503, "authentication_busy", "登录或注册人数较多，请稍后重试。")
+        try:
+            yield
+        finally:
+            self.auth_slots.release()
 
     def close(self):
         try:
@@ -79,19 +97,65 @@ class Application:
 
 
 class StudioServer(ThreadingHTTPServer):
-    daemon_threads = True
-    block_on_close = False
-    request_queue_size = 32
+    # 关闭监听后先等已接收请求结束，再由入口关闭任务和释放数据库实例锁。
+    daemon_threads = False
+    block_on_close = True
+    request_queue_size = 128
 
-    def __init__(self, address, app):
+    def __init__(self, address, app, *, max_connections=128, request_timeout=20):
+        if not isinstance(max_connections, int) or max_connections < 1 or request_timeout <= 0:
+            raise ValueError("连接数量和请求超时必须为正数。")
         self.app = app
+        self.request_slots = threading.BoundedSemaphore(max_connections)
+        self.request_timeout = request_timeout
         super().__init__(address, Handler)
         app.activate()
 
     def get_request(self):
         sock, address = super().get_request()
-        sock.settimeout(20)
+        sock.settimeout(self.request_timeout)
         return sock, address
+
+    def process_request(self, request, client_address):
+        # 不能让连接数直接决定线程和内存数量；超载请求不再创建线程。
+        if not self.request_slots.acquire(blocking=False):
+            body = json.dumps({"error": {"code": "server_busy", "message": "当前访问人数较多，请稍后重试。"}},
+                              ensure_ascii=False).encode("utf-8")
+            response = ("HTTP/1.1 503 Service Unavailable\r\n"
+                        "Content-Type: application/json; charset=utf-8\r\n"
+                        f"Content-Length: {len(body)}\r\n"
+                        "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+                        "Retry-After: 2\r\nConnection: close\r\n\r\n").encode("ascii")
+            try:
+                request.settimeout(min(1, self.request_timeout))
+                request.sendall(response + body)
+                request.shutdown(socket.SHUT_WR)
+                # 清掉已发送来的小请求，避免带未读数据直接 close 导致 TCP reset 吞掉 503。
+                # 接收总量和等待时间均有限；超载连接不会占用新的请求线程。
+                request.settimeout(min(0.1, self.request_timeout))
+                remaining = 128 * 1024
+                deadline = time.monotonic() + 0.1
+                while remaining and time.monotonic() < deadline:
+                    received = request.recv(min(FILE_CHUNK_BYTES, remaining))
+                    if not received:
+                        break
+                    remaining -= len(received)
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.request_slots.release()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -119,6 +183,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(403, {"error": {"code": "cross_origin", "message": "不允许跨站调用。"}})
 
     def _handle(self):
+        self.response_started = False
+        self.request_body_consumed = False
         try:
             self._check_host()
             self.path_parts = [part for part in unquote(urlsplit(self.path).path).split("/") if part]
@@ -135,11 +201,39 @@ class Handler(BaseHTTPRequestHandler):
                 raise DomainError(405, "method_not_allowed", "不支持此操作。")
         except DomainError as error:
             self._json(error.status, {"error": {"code": error.code, "message": error.message}})
+            if not self.request_body_consumed:
+                self._drain_rejected_body()
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             return
         except Exception:
             LOGGER.error("请求处理失败，未记录敏感请求内容")
-            self._json(500, {"error": {"code": "internal_error", "message": "服务暂时遇到问题，请稍后再试。"}})
+            # 图片传输中断后只关闭连接，不能在图片正文中再追加一个 JSON 响应。
+            if not self.response_started:
+                self._json(500, {"error": {"code": "internal_error", "message": "服务暂时遇到问题，请稍后再试。"}})
+            self.close_connection = True
+
+    def _drain_rejected_body(self):
+        if self.command not in {"POST", "PUT"}:
+            return
+        self.close_connection = True
+        try:
+            # 先完整送出错误响应，再收走少量未读正文，避免 Windows 关闭连接时用 RST 吞掉提示。
+            self.wfile.flush()
+            self.connection.shutdown(socket.SHUT_WR)
+            remaining = REJECTED_BODY_DRAIN_BYTES
+            deadline = time.monotonic() + REJECTED_BODY_DRAIN_SECONDS
+            while remaining:
+                seconds_left = deadline - time.monotonic()
+                if seconds_left <= 0:
+                    break
+                self.connection.settimeout(seconds_left)
+                chunk = self.rfile.read1(min(FILE_CHUNK_BYTES, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            # 超时或发送者已断开都直接结束；不等待无限正文，也不再追加错误响应。
+            pass
 
     def _check_host(self):
         host = self.headers.get("Host", "")
@@ -182,7 +276,9 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 <= length <= 65536:
             raise DomainError(413, "body_too_large", "提交内容过多，请适当精简。")
         try:
-            value = json.loads(self.rfile.read(length) or b"{}")
+            payload = self.rfile.read(length)
+            self.request_body_consumed = True
+            value = json.loads(payload or b"{}")
         except (UnicodeDecodeError, ValueError):
             raise DomainError(400, "invalid_json", "提交内容格式不正确。") from None
         if not isinstance(value, dict):
@@ -222,7 +318,7 @@ class Handler(BaseHTTPRequestHandler):
             if not ipaddress.ip_address(self.client_address[0]).is_loopback:
                 raise DomainError(403, "local_setup_only", "请在本机初始化管理员。")
             profile = {key: self.body.get(key, "") for key in ("name", "phone")}
-            with self.app.auth_slots:
+            with self.app.password_work():
                 user = store.create_user(profile, self.body.get("password", ""), role="admin")
             self._login(user)
             return
@@ -231,8 +327,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise DomainError(409, "setup_required", "请先由老师完成平台初始化。")
             self.app.limiter.check(("register", self.client_address[0]), 120, 600)
             profile = {key: self.body.get(key, "") for key in ("name", "phone", "region", "school", "grade")}
-            with self.app.auth_slots:
-                user = store.create_user(profile, self.body.get("password", ""), role="student")
+            with self.app.password_work():
+                user = store.create_user(profile, self.body.get("password", ""), role="student",
+                                         authorization_code=self.body.get("authorization_code"))
             self._login(user)
             return
         if route == ["login"] and method == "POST":
@@ -240,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
             self.app.limiter.check(("login", self.client_address[0]), 600, 600)
             if isinstance(phone, str):
                 self.app.limiter.check(("phone", phone[:32]), 8, 600)
-            with self.app.auth_slots:
+            with self.app.password_work():
                 user = store.authenticate(phone, self.body.get("password", ""))
             if user is None:
                 raise DomainError(401, "invalid_credentials", "手机号或密码不正确。")
@@ -276,9 +373,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"plan": plan})
         elif len(route) == 3 and route[0] == "plans" and route[2] == "preview" and method == "POST":
             plan = store.get_plan(user_id, route[1])
-            missing = missing_fields(plan["answers"])
-            self._json(200, {"prompt": "" if missing else build_prompt(plan["answers"]), "missing": missing,
-                             "summary": build_summary(plan["answers"])})
+            self._json(200, build_preview(plan["answers"]))
         elif route == ["generate"] and method == "POST":
             self.app.limiter.check(("generate", user_id), 20, 60)
             job = self.app.jobs.submit(user_id, self.body.get("plan_id", ""), self.body.get("request_key", ""))
@@ -311,8 +406,7 @@ class Handler(BaseHTTPRequestHandler):
             path = (base / artwork["image_path"]).resolve()
             if path.parent != base or not path.is_file():
                 raise DomainError(404, "image_missing", "图片文件暂不可用，请联系老师恢复。")
-            payload = path.read_bytes()
-            self._bytes(200, payload, artwork["mime"], download=("作品图片" + path.suffix) if route[2] == "download" else None)
+            self._file(path, artwork["mime"], download=("作品图片" + path.suffix) if route[2] == "download" else None)
         else:
             raise DomainError(404, "not_found", "没有找到此内容。")
 
@@ -322,7 +416,22 @@ class Handler(BaseHTTPRequestHandler):
         return result
 
     def _admin(self, route, user):
-        if route == ["settings"] and self.command == "GET":
+        if route == ["authorization-codes"] and self.command == "GET":
+            try:
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True, max_num_fields=20)
+                values = {}
+                for key, default in (("limit", "50"), ("before", None)):
+                    candidates = query.get(key, [default])
+                    value = candidates[0]
+                    if len(candidates) != 1 or value is not None and not re.fullmatch(r"[1-9][0-9]{0,15}", value):
+                        raise ValueError
+                    values[key] = int(value) if value is not None else None
+            except ValueError:
+                raise DomainError(400, "invalid_pagination", "分页数量或游标格式不正确。") from None
+            self._json(200, self.app.store.list_authorization_codes(user["id"], **values))
+        elif route == ["authorization-codes"] and self.command == "POST":
+            self._json(201, {"codes": self.app.store.create_authorization_codes(user["id"], self.body.get("count", 1))})
+        elif route == ["settings"] and self.command == "GET":
             self._json(200, self.app.settings.public())
         elif route == ["settings"] and self.command == "PUT":
             self._json(200, self.app.settings.update(self.body))
@@ -350,13 +459,15 @@ class Handler(BaseHTTPRequestHandler):
         mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         if path.suffix in {".js", ".css", ".html"}:
             mime += "; charset=utf-8"
-        self._bytes(200, path.read_bytes(), mime)
+        self._file(path, mime)
 
     def _headers(self, status, content_type, length, *, cookie=None, download=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "no-store")
+        if status == 503:
+            self.send_header("Retry-After", "2")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -372,6 +483,7 @@ class Handler(BaseHTTPRequestHandler):
         if download:
             from urllib.parse import quote
             self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(download))
+        self.response_started = True
         self.end_headers()
 
     def _json(self, status, payload, cookie=None):
@@ -382,3 +494,19 @@ class Handler(BaseHTTPRequestHandler):
     def _bytes(self, status, payload, mime, download=None):
         self._headers(status, mime, len(payload), download=download)
         self.wfile.write(payload)
+
+    def _file(self, path, mime, download=None):
+        try:
+            handle = path.open("rb")
+        except FileNotFoundError:
+            raise DomainError(404, "file_missing", "文件暂不可用，请联系老师恢复。") from None
+        with handle:
+            remaining = os.fstat(handle.fileno()).st_size
+            self._headers(200, mime, remaining, download=download)
+            # 每个下载连接最多持有一个小块，不随图片大小增加内存占用。
+            while remaining:
+                chunk = handle.read(min(FILE_CHUNK_BYTES, remaining))
+                if not chunk:
+                    raise OSError("文件在传输过程中变短")
+                self.wfile.write(chunk)
+                remaining -= len(chunk)

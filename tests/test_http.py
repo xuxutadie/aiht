@@ -50,7 +50,7 @@ class FakeSettings:
         return self.enabled
 
     def get(self):
-        return dict(self.values)
+        return {**self.values, "api_key": self.values["api_key"] if self.enabled else ""}
 
     def public(self):
         return {"configured": self.enabled, "model": self.values["model"],
@@ -146,13 +146,15 @@ class HttpTests(unittest.TestCase):
         status, data, _ = client.request("POST", "/api/setup", {
             "name": "指导老师", "phone": "13700137000", "password": "teacher123"})
         self.assertEqual(status, 200, data)
+        self.admin_client, self.admin_user = client, data["user"]
         return client, data["user"]
 
     def student(self, phone="13800138000", name="学生小明"):
         client = self.client()
+        code = self.app.store.create_authorization_codes(self.admin_user["id"])[0]["code"]
         status, data, _ = client.request("POST", "/api/register", {
             "name": name, "phone": phone, "password": "student123", "region": "贵州省贵阳市",
-            "school": "示例中学", "grade": "七年级"})
+            "school": "示例中学", "grade": "七年级", "authorization_code": code})
         self.assertEqual(status, 200, data)
         return client, data["user"]
 
@@ -205,7 +207,8 @@ class HttpTests(unittest.TestCase):
         self.admin()
         client, user = self.student()
         self.assertEqual((user["credits"], user["reserved_credits"], user["available_credits"]), (10, 0, 10))
-        self.assertEqual(client.request("POST", "/api/register", {"name": "学生", "phone": "13800138000", "password": "student123", "region": "贵州", "school": "示例学校", "grade": "七年级"})[0], 409)
+        code = self.app.store.create_authorization_codes(self.admin_user["id"])[0]["code"]
+        self.assertEqual(client.request("POST", "/api/register", {"name": "学生", "phone": "13800138000", "password": "student123", "region": "贵州", "school": "示例学校", "grade": "七年级", "authorization_code": code})[0], 409)
         self.assertEqual(client.request("POST", "/api/logout")[0], 200)
         self.assertEqual(client.request("GET", "/api/me")[0], 401)
         self.assertEqual(client.request("POST", "/api/login", {"phone": "13800138000", "password": "wrong123"})[0], 401)
@@ -239,6 +242,76 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(data["plan"]["confirmed"])
         self.assertEqual(self.generate(client, plan)[0], 409)
         self.assertEqual(self.provider.calls, 0)
+
+    def test_manual_prompt_preview_and_empty_draft_confirmation(self):
+        self.admin()
+        client, _ = self.student()
+        plan = self.plan(client, confirmed=False)
+        path = f"/api/plans/{plan['id']}"
+        answers = {**plan["answers"], "subject_framing": "半身", "scene_distance": "近景",
+                   "custom_prompt": "手动改写：让机器人照顾老人，突出关切的表情。"}
+        status, data, _ = client.request("PUT", path, {"answers": answers, "step": 4, "confirmed": False})
+        self.assertEqual(status, 200, data)
+        status, preview, _ = client.request("POST", path + "/preview")
+        self.assertEqual(status, 200, preview)
+        self.assertEqual(preview["prompt"], answers["custom_prompt"])
+        self.assertEqual(preview["prompt_mode"], "custom")
+        self.assertIn("半身", preview["template_prompt"])
+        self.assertIn("近景", preview["template_prompt"])
+        blank = {**answers, "custom_prompt": " \n "}
+        self.assertEqual(client.request("PUT", path, {"answers": blank, "step": 4})[0], 200)
+        status, preview, _ = client.request("POST", path + "/preview")
+        self.assertEqual(status, 200, preview)
+        self.assertEqual(preview["prompt"], "")
+        self.assertIn("近景", preview["template_prompt"])
+        self.assertIn("手动改写提示词", preview["missing"])
+        status, error, _ = client.request("PUT", path, {"answers": blank, "step": 5, "confirmed": True})
+        self.assertEqual(status, 400, error)
+        self.assertEqual(error["error"]["code"], "empty_prompt")
+        self.assertEqual(self.provider.calls, 0)
+
+    def test_manual_prompt_job_snapshot_and_recovery_reach_provider_once(self):
+        self.admin()
+        client, _ = self.student()
+        plan = self.plan(client, confirmed=False)
+        path = f"/api/plans/{plan['id']}"
+        manual = "敬老院里机器人为老人整理毯子，人物半身、中景，动漫风格。"
+        answers = {**plan["answers"], "subject_framing": "半身", "scene_distance": "中景", "custom_prompt": manual}
+        status, saved, _ = client.request("PUT", path, {"answers": answers, "step": 5, "confirmed": True})
+        self.assertEqual(status, 200, saved)
+        self.assertTrue(saved["plan"]["confirmed"])
+        prompts = []
+        original_generate = self.provider.generate
+
+        def capture(prompt, options):
+            prompts.append(prompt)
+            return original_generate(prompt, options)
+
+        self.provider.generate = capture
+        self.provider.release.clear()
+        key = str(uuid.uuid4())
+        status, submitted, _ = self.generate(client, plan, key)
+        self.assertEqual(status, 202, submitted)
+        job_id = submitted["job"]["id"]
+        self.assertTrue(self.provider.entered.wait(2))
+        changed = {**answers, "custom_prompt": "后来修改的第二稿"}
+        status, saved, _ = client.request("PUT", path, {"answers": changed, "step": 4, "confirmed": True})
+        self.assertEqual(status, 200, saved)
+        self.assertFalse(saved["plan"]["confirmed"])
+        status, recovered, _ = self.generate(client, plan, key)
+        self.assertEqual(status, 202, recovered)
+        self.assertEqual(recovered["job"]["id"], job_id)
+        self.assertEqual(self.generate(client, plan)[0], 409)
+        self.provider.release.set()
+        completed = self.wait_job(client, job_id)
+        self.assertEqual(completed["job"]["status"], "succeeded")
+        self.assertEqual(prompts, [manual])
+        self.assertEqual((completed["user"]["credits"], completed["user"]["reserved_credits"]), (9, 0))
+        status, gallery, _ = client.request("GET", "/api/artworks")
+        self.assertEqual(status, 200, gallery)
+        self.assertEqual(len(gallery["artworks"]), 1)
+        self.assertEqual(gallery["artworks"][0]["prompt"], manual)
+        self.assertEqual(gallery["artworks"][0]["answers"]["custom_prompt"], manual)
 
     def test_success_and_concurrent_duplicate_key_call_provider_once(self):
         self.admin()

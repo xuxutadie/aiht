@@ -1,6 +1,8 @@
 """生成执行器的进程互斥、关闭行为和快照竞态回归测试。"""
 
 from pathlib import Path
+from concurrent.futures import Future
+import json
 import struct
 import tempfile
 import threading
@@ -11,7 +13,8 @@ import uuid
 import zlib
 
 from studio.contracts import DomainError
-from studio.provider import GeneratedImage, ProviderError
+from studio.provider import GeneratedImage, ProviderError, Provider
+from studio.secrets import config_fingerprint
 from studio.web import Application
 
 
@@ -31,6 +34,15 @@ def complete_answers():
 
 
 class FakeSettings:
+    def __init__(self):
+        self.calls = 0
+        self.values = {"api_key": "job-test-key-only-0123456789", "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+                       "model": "doubao-seedream-5-0-flash-260915", "watermark": True, "quality": "low"}
+
+    def get(self):
+        self.calls += 1
+        return dict(self.values)
+
     def configured(self):
         return True
 
@@ -62,8 +74,10 @@ class JobsTests(unittest.TestCase):
         self.settings = FakeSettings()
         self.app = Application(self.data_dir, provider=self.provider, settings=self.settings, test_mode=True)
         self.addCleanup(self.cleanup)
+        admin = self.app.store.create_user({"name": "指导老师", "phone": "13700137000"}, "teacher123", role="admin")
+        code = self.app.store.create_authorization_codes(admin["id"])[0]["code"]
         self.user = self.app.store.create_user({"name": "学生小明", "phone": "13800138000", "region": "贵州",
-                                               "school": "示例中学", "grade": "七年级"}, "student123")
+                                               "school": "示例中学", "grade": "七年级"}, "student123", authorization_code=code)
         plan = self.app.store.create_plan(self.user["id"], "绿色城市", complete_answers())
         self.plan = self.app.store.save_plan(self.user["id"], plan["id"], plan["answers"], 5, True)
 
@@ -147,6 +161,30 @@ class JobsTests(unittest.TestCase):
         self.assertEqual((user["credits"], user["reserved_credits"], user["available_credits"]), (10, 0, 10))
         self.assertIsNone(self.app.store.get_job_by_request(self.user["id"], key))
         self.assertEqual(self.provider.calls, 0)
+
+    def test_submission_takes_one_config_snapshot_without_storing_secret(self):
+        job = self.submit()
+        self.assertTrue(self.provider.entered.wait(2))
+        options = self.app.store.get_job_internal(job["id"])["options"]
+        self.assertEqual(options["base_url"], self.settings.values["base_url"])
+        self.assertEqual(options["model"], self.settings.values["model"])
+        self.assertEqual(options["quality"], "low")
+        self.assertTrue(options["watermark"])
+        self.assertEqual(options["config_fingerprint"], config_fingerprint(self.settings.values))
+        self.assertNotIn(self.settings.values["api_key"], json.dumps(options))
+        self.assertEqual(self.settings.calls, 1)
+
+    def test_changed_config_fails_before_network_and_returns_reservation(self):
+        self.app.jobs.provider = Provider(self.settings)
+        with patch.object(self.app.jobs.executor, "submit", return_value=Future()):
+            job = self.submit()
+        self.settings.values["quality"] = "high"
+        with patch("studio.provider._open", side_effect=AssertionError("配置变化后不能发送请求")) as opened:
+            self.app.jobs._run(job["id"])
+        opened.assert_not_called()
+        self.assertEqual(self.app.store.get_job(self.user["id"], job["id"])["status"], "failed")
+        user = self.app.store.get_user(self.user["id"])
+        self.assertEqual((user["credits"], user["reserved_credits"]), (10, 0))
 
 
 if __name__ == "__main__":

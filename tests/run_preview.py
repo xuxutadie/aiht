@@ -13,6 +13,10 @@ from test_provider import png as png_bytes
 
 
 class PreviewSettings:
+    def get(self):
+        return {"api_key": "preview-test-config-no-upstream", "model": "doubao-seedream-5-0-flash-260915",
+                "base_url": "https://ark.cn-beijing.volces.com/api/v3", "watermark": True, "quality": "low"}
+
     def configured(self):
         return True
 
@@ -51,8 +55,10 @@ def main():
         app.store.create_user({"name": "验收老师", "phone": "19900000001"}, password, role="admin")
     student = app.store.authenticate("19900000002", password)
     if not student:
+        admin = next(user for user in app.store.list_users() if user["role"] == "admin")
+        code = app.store.create_authorization_codes(admin["id"])[0]["code"]
         student = app.store.create_user({"name": "验收同学", "phone": "19900000002", "region": "测试地区",
-                                         "school": "测试学校", "grade": "小学五年级"}, password)
+                                         "school": "测试学校", "grade": "小学五年级"}, password, authorization_code=code)
     if not app.store.list_plans(student["id"]):
         plan = app.store.create_plan(student["id"], "给小鸟让路的城市", complete_answers())
         app.store.save_plan(student["id"], plan["id"], complete_answers(), 2)

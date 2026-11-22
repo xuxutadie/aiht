@@ -13,12 +13,12 @@ export const STEPS = [
     ['message', '你希望大家明白什么？', true, true, '用一句话说清楚你想传递的意思。'],
     ['message_detail', '用哪个画面细节表达它？', true, true, '让想法落在看得见的细节上。'],
   ] },
-  { name: '设计画面', title: '让想法，变成看得见的画面。', intro: '说明主体、场景与动作，再决定画面比例和风格。', hint: '把画面想象成定格的一秒：谁在什么地方，正在做什么？用两三个关键细节突出主题。', fields: [
+  { name: '设计画面', title: '让想法，变成看得见的画面。', intro: '说明主体、场景与动作，再选择主体范围、场景景别、画面比例和风格。', hint: '把画面想象成定格的一秒：谁在什么地方，正在做什么？全身或特写决定主体展示多少，远景或近景决定环境展示多少。', fields: [
     ['subject', '画面主体是谁或是什么？', false, true, '写清主体的外形、身份或特征。'],
     ['scene', '它在哪里？', true, true, '交代环境、空间、时间和氛围。'],
     ['action', '正在做什么？', true, true, '一个清楚的动作，会让画面更有故事。'],
     ['details', '还需要哪些重要细节？', true, true, '例如色彩、光线、物件的位置与相互关系。'],
-    ['style_reason', '为什么选这个风格和比例？', true, true, '说说它们如何帮助表达主题。'],
+    ['style_reason', '为什么选这样的取景、风格和比例？', true, true, '说说它们如何帮助表达主题。'],
   ] },
   { name: '提炼创新', title: '你的特别之处，能在图里看见吗？', intro: '选择一种创新方向，再具体说清楚。创新需要体现在画面里。', hint: '“很酷”“很有创意”还不够。说清楚和常见作品有什么区别，并找到可见的证据。', fields: [
     ['innovation', '说说你的创新点', true, true, '写出一个具体的变化，不必追求复杂。'],
@@ -42,4 +42,4 @@ export const DEFAULT_ANSWERS = {
 };
 
 export const FIELD_LABELS = Object.fromEntries(STEPS.flatMap(step => step.fields.map(field => [field[0], field[1]])));
-Object.assign(FIELD_LABELS, { ratio: '画面比例', style: '画面风格', innovation_type: '创新方向' });
+Object.assign(FIELD_LABELS, { ratio: '画面比例', style: '画面风格', innovation_type: '创新方向', subject_framing: '主体展示范围', scene_distance: '场景景别', custom_prompt: '手动改写提示词' });

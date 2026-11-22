@@ -10,9 +10,10 @@ import re
 import threading
 import uuid
 
-from .contracts import DomainError
+from .contracts import DomainError, MODEL_DEFAULT
 from .plans import build_prompt, build_summary
 from .provider import ProviderError
+from .secrets import BASE_URL_DEFAULT, validate_base_url, config_fingerprint
 
 LOGGER = logging.getLogger("creation.jobs")
 
@@ -43,10 +44,15 @@ class JobManager:
         if not plan["confirmed"]:
             raise DomainError(409, "plan_not_confirmed", "请先完成并确认创作方案。")
         prompt = build_prompt(plan["answers"])
-        options = {"ratio": plan["answers"]["ratio"], "style": plan["answers"]["style"]}
-        # 配置检查必须发生在预占之前，未配置不能减少学生可用算力。
-        if not self.settings.configured():
+        # 在预占前只读取一次完整配置；任务仅保存不可逆指纹，不保存明文密钥。
+        config = self.settings.get()
+        if not isinstance(config, dict) or not config.get("api_key"):
             raise DomainError(409, "generation_not_configured", "绘图服务尚未配置，请联系老师。")
+        service_fingerprint = config_fingerprint(config)
+        options = {"ratio": plan["answers"]["ratio"], "style": plan["answers"]["style"],
+                   "base_url": validate_base_url(config.get("base_url", BASE_URL_DEFAULT)),
+                   "model": config.get("model", MODEL_DEFAULT), "watermark": config.get("watermark", True),
+                   "quality": config.get("quality", "low"), "config_fingerprint": service_fingerprint}
         encoded = json.dumps({"title": plan["title"], "answers": plan["answers"]},
                              ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         fingerprint = hashlib.sha256(encoded).hexdigest()

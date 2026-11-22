@@ -22,28 +22,98 @@ def _session_hash(token):
         return None
 
 
+def _authorization_code_hash(value):
+    """完整授权码只在输入或生成时短暂使用，持久化只保存摘要与尾号。"""
+    if value is None or isinstance(value, str) and not value.strip():
+        raise DomainError(400, "authorization_code_required", "请填写老师提供的8位数字授权码。")
+    if not isinstance(value, str) or not re.fullmatch(r"[1-9][0-9]{7}", value.strip()):
+        raise DomainError(400, "invalid_authorization_code", "授权码无效或已使用，请联系老师获取有效授权码。")
+    return hashlib.sha256(value.strip().encode("ascii")).hexdigest()
+
+
+def _authorization_code_record(row):
+    result = {key: row[key] for key in ("id", "code_hint", "created_at", "used_at", "used_by")}
+    result["status"] = "used" if result["used_by"] is not None else "unused"
+    return result
+
+
 class Store(GenerationStore, Database):
     def has_admin(self):
         with self.connection() as connection:
             return connection.execute("SELECT 1 FROM users WHERE role = 'admin' LIMIT 1").fetchone() is not None
 
-    def create_user(self, profile: dict, password: str, role="student") -> dict:
+    def create_user(self, profile: dict, password: str, role="student", authorization_code=None) -> dict:
         values = validate_profile(profile, role)
+        code_hash = _authorization_code_hash(authorization_code) if role == "student" else None
         encoded = hash_password(password)
         user_id = new_id()
         try:
             with self.transaction() as connection:
                 if role == "admin" and connection.execute("SELECT 1 FROM users WHERE role = 'admin'").fetchone():
                     raise DomainError(409, "setup_complete", "管理员已完成初始化，请直接登录。")
+                if role == "student":
+                    code = connection.execute(
+                        "SELECT id FROM authorization_codes WHERE code_hash = ? AND used_by IS NULL",
+                        (code_hash,)).fetchone()
+                    if code is None:
+                        raise DomainError(400, "invalid_authorization_code", "授权码无效或已使用，请联系老师获取有效授权码。")
+                timestamp = now()
                 connection.execute("""INSERT INTO users
                     (id,name,phone,region,school,grade,role,password_hash,credits,reserved_credits,created_at)
                     VALUES (?,?,?,?,?,?,?,?,?,0,?)""",
                     (user_id, values["name"], values["phone"], values["region"], values["school"],
-                     values["grade"], role, encoded, INITIAL_CREDITS, now()))
+                     values["grade"], role, encoded, INITIAL_CREDITS, timestamp))
                 self._ledger_in(connection, user_id, "grant", INITIAL_CREDITS, None, "首次注册赠送10点算力")
+                if role == "student":
+                    # 与开户和赠送共用写事务；任一步失败会一并回滚，不能耗掉授权码。
+                    connection.execute("UPDATE authorization_codes SET used_by = ?, used_at = ? WHERE id = ?",
+                                       (user_id, timestamp, code["id"]))
                 return self._user_in(connection, user_id)
-        except sqlite3.IntegrityError:
-            raise DomainError(409, "phone_registered", "该手机号已注册，请直接登录。") from None
+        except sqlite3.IntegrityError as error:
+            if str(error) == "UNIQUE constraint failed: users.phone":
+                raise DomainError(409, "phone_registered", "该手机号已注册，请直接登录。") from None
+            raise
+
+    def _authorization_admin_in(self, connection, admin_user_id):
+        admin = self._user_in(connection, admin_user_id)
+        if admin["role"] != "admin":
+            raise DomainError(403, "admin_required", "此功能仅供老师管理员使用。")
+
+    def create_authorization_codes(self, admin_user_id, count=1):
+        if type(count) is not int or not 1 <= count <= 100:
+            raise DomainError(400, "invalid_authorization_code_count", "每批授权码数量须为1至100之间的整数。")
+        with self.transaction() as connection:
+            self._authorization_admin_in(connection, admin_user_id)
+            timestamp, created = now(), []
+            # 碰撞可以重试，但必须限制单次请求占用写锁的时间。
+            for _ in range(max(1000, count * 20)):
+                code = str(secrets.randbelow(90_000_000) + 10_000_000)
+                result = connection.execute("""INSERT INTO authorization_codes
+                    (code_hash,code_hint,created_by,created_at) VALUES (?,?,?,?)
+                    ON CONFLICT(code_hash) DO NOTHING""",
+                    (hashlib.sha256(code.encode("ascii")).hexdigest(), code[-4:], admin_user_id, timestamp))
+                if result.rowcount == 0:
+                    continue
+                # 仅本次生成响应携带完整码，查询接口不再提供完整码或摘要。
+                created.append({"id": result.lastrowid, "code": code, "code_hint": code[-4:],
+                                "status": "unused", "created_at": timestamp, "used_at": None, "used_by": None})
+                if len(created) == count:
+                    return created
+            raise DomainError(503, "authorization_code_generation_failed", "授权码暂时生成失败，请稍后重试。")
+
+    def list_authorization_codes(self, admin_user_id, limit=50, before=None):
+        if (type(limit) is not int or not 1 <= limit <= 100
+                or before is not None and (type(before) is not int or not 1 <= before <= 9_007_199_254_740_991)):
+            raise DomainError(400, "invalid_pagination", "分页数量或游标格式不正确。")
+        with self.connection() as connection:
+            self._authorization_admin_in(connection, admin_user_id)
+            condition = "WHERE id < ?" if before is not None else ""
+            parameters = (before, limit + 1) if before is not None else (limit + 1,)
+            rows = connection.execute(
+                f"SELECT id,code_hint,created_at,used_at,used_by FROM authorization_codes {condition} ORDER BY id DESC LIMIT ?",
+                parameters).fetchall()
+            codes = [_authorization_code_record(row) for row in rows[:limit]]
+            return {"codes": codes, "next_cursor": codes[-1]["id"] if len(rows) > limit else None}
 
     def authenticate(self, phone, password):
         if (not isinstance(phone, str) or len(phone) > 11

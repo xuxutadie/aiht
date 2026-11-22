@@ -39,6 +39,14 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS only_initial_admin ON users(role) WHERE role = 'admin';
+CREATE TABLE IF NOT EXISTS authorization_codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code_hash TEXT UNIQUE NOT NULL, code_hint TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+    used_by TEXT UNIQUE REFERENCES users(id), used_at TEXT,
+    CHECK ((used_by IS NULL AND used_at IS NULL) OR (used_by IS NOT NULL AND used_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS authorization_codes_created_by ON authorization_codes(created_by);
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
     expires_at INTEGER NOT NULL, created_at TEXT NOT NULL

@@ -15,6 +15,7 @@ let breadcrumb;
 let nav;
 let creditText;
 let bannerObserver;
+let bootstrapBusy = false;
 const VIEWS = { workspace: ['创', '创作工作台'], artworks: ['作', '我的作品'], drafts: ['稿', '草稿'], credits: ['算', '算力记录'], admin: ['管', '后台设置'] };
 
 function mount(...nodes) {
@@ -59,7 +60,7 @@ function shell() {
 
 async function signedIn(user) {
   creditReminder.reset();
-  const bootstrap = await api('/api/bootstrap'); state.configured = bootstrap.generation_configured; state.testMode = Boolean(bootstrap.test_mode);
+  const bootstrap = await api('/api/bootstrap', { timeoutMs: 15000 }); state.configured = bootstrap.generation_configured; state.testMode = Boolean(bootstrap.test_mode);
   state.user = bootstrap.user || user;
   shell(); onUser(state.user); await navigate('workspace', { skipSave: true });
 }
@@ -77,8 +78,8 @@ async function navigate(view, options = {}) {
     if (view === 'workspace') {
       let plan = options.plan;
       if (!plan) {
-        const { plans } = await api('/api/plans');
-        if (plans.length) plan = (await api(`/api/plans/${encodeURIComponent(plans[0].id)}`)).plan;
+        const { plans } = await api('/api/plans', { timeoutMs: 15000 });
+        if (plans.length) plan = (await api(`/api/plans/${encodeURIComponent(plans[0].id)}`, { timeoutMs: 15000 })).plan;
         else plan = (await post('/api/plans', { title: '我的创作练习', answers: { ...DEFAULT_ANSWERS } })).plan;
       }
       state.plan = plan;
@@ -122,13 +123,18 @@ async function logout() {
   try { if (state.workspace) await state.workspace.saveBeforeLeave(); await post('/api/logout'); state.workspace?.dispose(); state.workspace = null; state.user = null; creditReminder.reset(); mount(authScreen(false, user => signedIn(user).catch(err => toast(err.message, true)))); }
   catch (err) { toast(err.message, true); }
 }
-async function bootstrap() {
+async function bootstrap(event) {
+  if (bootstrapBusy) return;
+  bootstrapBusy = true;
+  const control = event?.currentTarget;
+  if (control) { control.disabled = true; control.textContent = '正在连接…'; }
   try {
-    const data = await api('/api/bootstrap');
+    const data = await api('/api/bootstrap', { timeoutMs: 15000 });
     state.configured = data.generation_configured; state.testMode = Boolean(data.test_mode);
     if (data.user) { state.user = data.user; shell(); onUser(data.user); await navigate('workspace', { skipSave: true }); }
-    else mount(authScreen(data.setup_required, user => signedIn(user).catch(err => toast(err.message, true))));
+    else mount(authScreen(data.setup_required, user => signedIn(user).catch(err => toast(err.message, true)), { setupTokenRequired: Boolean(data.setup_token_required) }));
   } catch (err) { root.replaceChildren(el('main', { id: 'main', className: 'initial-loading' }, el('span', { className: 'brand-mark' }, '创'), el('h1', {}, '作品创作台'), notice(err.message, 'error'), button('重新连接', bootstrap, 'button primary'))); }
+  finally { bootstrapBusy = false; if (control) control.disabled = false; }
 }
 window.addEventListener('session-expired', () => {
   if (!state.user) return;

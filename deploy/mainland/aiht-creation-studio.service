@@ -1,0 +1,37 @@
+[Unit]
+Description=AIHT student creation studio
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=aiht
+DynamicUser=true
+StateDirectory=aiht-creation-studio
+StateDirectoryMode=0700
+WorkingDirectory=/opt/aiht-creation-studio
+ExecStart=/usr/bin/python3 -u /opt/aiht-creation-studio/server.py --host 127.0.0.1 --port 8321 --data-dir /var/lib/aiht-creation-studio --public-url https://xqd-ai.cn
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Restart=on-failure
+RestartSec=5
+# 已发出的生图要等待结果并结算，停止时不要立刻强杀。
+KillSignal=SIGINT
+TimeoutStopSec=240
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aiht-creation-studio
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TasksMax=256
+LimitNOFILE=4096
+# 为 2GB 主机上的宝塔、Nginx 与系统保留空间；不能当成并发容量承诺。
+MemoryHigh=600M
+MemoryMax=900M
+
+[Install]
+WantedBy=multi-user.target

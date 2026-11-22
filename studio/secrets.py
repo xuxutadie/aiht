@@ -7,6 +7,7 @@
 import base64
 import ctypes
 from ctypes import wintypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,29 +20,66 @@ from .contracts import DomainError, MODEL_DEFAULT
 
 
 BASE_URL_DEFAULT = "https://ark.cn-beijing.volces.com/api/v3"
+HK_BASE_URL = "https://api.openai-hk.com/v1"
 _MODEL_PATTERN = re.compile(r"doubao-seedream-5-0-flash(?:-[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
 
 
 def validate_base_url(value):
-    """管理员输入也必须遵守固定官方地址，避免凭配置访问内网。"""
-    if not isinstance(value, str) or any(ord(char) <= 32 for char in value):
-        raise DomainError(400, "invalid_settings", "接口地址必须使用火山方舟官方 HTTPS 地址。")
+    """管理员只能选择已经适配的固定服务地址，不能凭配置访问任意主机。"""
+    message = "接口地址仅支持火山方舟或 OpenAI-HK 的固定 HTTPS 地址。"
+    if (not isinstance(value, str) or any(ord(char) <= 32 for char in value)
+            or "?" in value or "#" in value or "\\" in value):
+        raise DomainError(400, "invalid_settings", message)
     try:
         parsed = urlsplit(value)
-        valid = (parsed.scheme == "https" and parsed.netloc == "ark.cn-beijing.volces.com"
-                 and parsed.path in ("", "/", "/api/v3", "/api/v3/")
-                 and not parsed.query and not parsed.fragment)
+        common = parsed.scheme == "https" and not parsed.query and not parsed.fragment
+        if common and parsed.netloc == "ark.cn-beijing.volces.com" and parsed.path in ("", "/", "/api/v3", "/api/v3/"):
+            return BASE_URL_DEFAULT
+        if common and parsed.netloc == "api.openai-hk.com" and parsed.path in ("", "/", "/v1", "/v1/"):
+            return HK_BASE_URL
     except ValueError:
-        valid = False
+        pass
+    raise DomainError(400, "invalid_settings", message)
+
+
+def provider_from_base(base_url):
+    return "openai-hk" if validate_base_url(base_url) == HK_BASE_URL else "ark"
+
+
+def validate_model(value, base_url=BASE_URL_DEFAULT):
+    provider = provider_from_base(base_url)
+    valid = isinstance(value, str) and len(value) <= 128
+    valid = valid and (value == "gpt-image-2" if provider == "openai-hk" else bool(_MODEL_PATTERN.fullmatch(value)))
     if not valid:
-        raise DomainError(400, "invalid_settings", "接口地址必须使用火山方舟官方 HTTPS 地址。")
-    return BASE_URL_DEFAULT
-
-
-def validate_model(value):
-    if not isinstance(value, str) or len(value) > 128 or not _MODEL_PATTERN.fullmatch(value):
-        raise DomainError(400, "invalid_settings", "本创作台仅支持 Seedream 5.0 Flash 图片模型。")
+        message = "OpenAI-HK 当前仅支持 gpt-image-2 图片模型。" if provider == "openai-hk" else "火山方舟当前仅支持 Seedream 5.0 Flash 图片模型。"
+        raise DomainError(400, "invalid_settings", message)
     return value
+
+
+def validate_quality(value):
+    if value not in ("low", "medium", "high"):
+        raise DomainError(400, "invalid_settings", "绘图质量仅支持 low、medium 或 high。")
+    return value
+
+
+def config_fingerprint(config):
+    """任务只保存不可逆配置指纹，避免排队期间被改用另一套绘图服务。"""
+    if not isinstance(config, dict):
+        raise DomainError(400, "invalid_settings", "出图设置格式不正确。")
+    base_url = validate_base_url(config.get("base_url", BASE_URL_DEFAULT))
+    model = validate_model(config.get("model", MODEL_DEFAULT), base_url)
+    watermark = config.get("watermark", True)
+    if type(watermark) is not bool:
+        raise DomainError(400, "invalid_settings", "水印设置必须为开启或关闭。")
+    quality = validate_quality(config.get("quality", "low"))
+    key = config.get("api_key", "")
+    if key:
+        _validate_key(key)
+    elif not isinstance(key, str):
+        _validate_key(key)
+    encoded = json.dumps([base_url, model, watermark, quality, key], ensure_ascii=False,
+                         separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _validate_key(value):
@@ -92,7 +130,7 @@ class SecretSettings:
         self._lock = threading.RLock()
 
     def _read(self):
-        config = {"model": MODEL_DEFAULT, "base_url": BASE_URL_DEFAULT, "watermark": True}
+        config = {"model": MODEL_DEFAULT, "base_url": BASE_URL_DEFAULT, "watermark": True, "quality": "low"}
         if not self.path.exists():
             return config
         try:
@@ -101,8 +139,9 @@ class SecretSettings:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("配置结构错误")
-            config["model"] = validate_model(payload.get("model", MODEL_DEFAULT))
             config["base_url"] = validate_base_url(payload.get("base_url", BASE_URL_DEFAULT))
+            config["model"] = validate_model(payload.get("model", MODEL_DEFAULT), config["base_url"])
+            config["quality"] = validate_quality(payload.get("quality", "low"))
             watermark = payload.get("watermark", True)
             if type(watermark) is not bool:
                 raise ValueError("水印设置错误")
@@ -122,9 +161,10 @@ class SecretSettings:
         with self._lock:
             config = self._read()
             # 保存的密钥优先。环境密钥只作为外部来源，绝不自动落盘。
-            if not config.get("api_key"):
+            if not config.get("api_key") and provider_from_base(config["base_url"]) == "ark":
                 external = os.environ.get("SEEDREAM_API_KEY", "")
                 config["api_key"] = _validate_key(external) if external else ""
+            config.setdefault("api_key", "")
             return dict(config)
 
     def configured(self):
@@ -134,6 +174,7 @@ class SecretSettings:
         config = self.get()
         key = config["api_key"]
         return {"configured": bool(key), "model": config["model"], "base_url": config["base_url"],
+                "provider": provider_from_base(config["base_url"]), "quality": config["quality"],
                 "watermark": config["watermark"], "key_hint": "••••" + key[-4:] if key else ""}
 
     def update(self, payload):
@@ -141,16 +182,23 @@ class SecretSettings:
             raise DomainError(400, "invalid_settings", "出图设置格式不正确。")
         with self._lock:
             current = self._read()
-            model = validate_model(payload.get("model", current["model"]))
             base_url = validate_base_url(payload.get("base_url", current["base_url"]))
+            provider = provider_from_base(base_url)
+            if "provider" in payload and payload["provider"] != provider:
+                raise DomainError(400, "invalid_settings", "绘图服务与接口地址不一致。")
+            model = validate_model(payload.get("model", current["model"]), base_url)
+            quality = validate_quality(payload.get("quality", current["quality"]))
             watermark = payload.get("watermark", current["watermark"])
             if type(watermark) is not bool:
                 raise DomainError(400, "invalid_settings", "水印设置必须为开启或关闭。")
             new_key = payload.get("api_key", "")
             if not isinstance(new_key, str):
                 _validate_key(new_key)
+            # 跨服务商时必须明确输入新密钥，绝不把原服务商的密钥送给另一方。
+            if provider != provider_from_base(current["base_url"]) and not new_key:
+                raise DomainError(400, "invalid_settings", "切换绘图服务时请填写对应服务的新 API 密钥。")
             key = _validate_key(new_key) if new_key else current.get("api_key", "")
-            stored = {"model": model, "base_url": base_url, "watermark": watermark}
+            stored = {"model": model, "base_url": base_url, "watermark": watermark, "quality": quality}
             temp_path = None
             try:
                 if key:

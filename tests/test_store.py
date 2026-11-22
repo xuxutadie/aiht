@@ -25,7 +25,9 @@ class StoreTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.db_path = Path(self.directory.name) / "studio.sqlite3"
         self.store = Store(self.db_path)
-        self.user = self.store.create_user(profile(), "student123")
+        self._admin = self.store.create_user({"name": "指导老师", "phone": "13700137000"},
+                                             "teacher123", role="admin")
+        self.user = self.create_student(profile(), "student123")
         self.plan = self.store.create_plan(self.user["id"], "未来城市", {"theme": "绿色"})
         self.plan = self.store.save_plan(self.user["id"], self.plan["id"],
                                          self.plan["answers"], 4, True)
@@ -44,17 +46,20 @@ class StoreTests(unittest.TestCase):
                 "height": 1024, "description": "作品说明", "reflection": "我的思考"}
 
     def second_user(self):
-        return self.store.create_user(profile("13900139000", "小红同学"), "student456")
+        return self.create_student(profile("13900139000", "小红同学"), "student456")
+
+    def create_student(self, data, password):
+        code = self.store.create_authorization_codes(self._admin["id"])[0]["code"]
+        return self.store.create_user(data, password, authorization_code=code)
 
     def admin(self):
-        return self.store.create_user({"name": "指导老师", "phone": "13700137000"},
-                                      "teacher123", role="admin")
+        return self._admin
 
     def test_registration_grants_once_and_duplicate_phone_cannot_grant_again(self):
         self.assertEqual(self.user["credits"], 10)
         self.assertEqual(self.user["reserved_credits"], 0)
         self.assertEqual(self.user["available_credits"], 10)
-        self.assert_error(409, lambda: self.store.create_user(profile(), "student456"))
+        self.assert_error(409, lambda: self.create_student(profile(), "student456"))
         entries = self.store.ledger(self.user["id"])
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["delta"], 10)
@@ -96,32 +101,33 @@ class StoreTests(unittest.TestCase):
                              ("name", "a" * 1000), ("phone", "1" * 10000)):
             data = profile("13600136000")
             data[field] = value
-            self.assert_error(400, lambda d=data: self.store.create_user(d, "student123"))
-        self.assert_error(400, lambda: self.store.create_user(profile("13600136000"), "a" * 129))
-        self.assertEqual(len(self.store.list_users()), 1)
+            self.assert_error(400, lambda d=data: self.create_student(d, "student123"))
+        self.assert_error(400, lambda: self.create_student(profile("13600136000"), "a" * 129))
+        self.assertEqual(len(self.store.list_users()), 2)
 
     def test_malformed_unicode_profile_has_a_safe_validation_error(self):
         data = profile("13600136000")
         data["name"] = "测试\ud800"
-        self.assert_error(400, lambda: self.store.create_user(data, "student123"))
+        self.assert_error(400, lambda: self.create_student(data, "student123"))
 
     def test_malformed_unicode_text_has_a_safe_validation_error(self):
         self.assert_error(400, lambda: self.store.create_plan(self.user["id"], "测试\ud800"))
 
     def test_only_one_admin_can_be_created_under_concurrency(self):
+        store = Store(Path(self.directory.name) / "fresh-setup.sqlite3")
         barrier = threading.Barrier(2)
         def create(phone):
             barrier.wait()
             try:
-                self.store.create_user({"name": "老师", "phone": phone}, "teacher123", "admin")
+                store.create_user({"name": "老师", "phone": phone}, "teacher123", "admin")
                 return "created"
             except DomainError as error:
                 return error.status
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(create, ("13500135000", "13600136000")))
         self.assertCountEqual(results, ["created", 409])
-        self.assertTrue(self.store.has_admin())
-        self.assertEqual(sum(u["role"] == "admin" for u in self.store.list_users()), 1)
+        self.assertTrue(store.has_admin())
+        self.assertEqual(sum(u["role"] == "admin" for u in store.list_users()), 1)
 
     def test_sessions_store_only_hash_expire_and_logout(self):
         token = self.store.create_session(self.user["id"])

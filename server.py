@@ -3,6 +3,7 @@
 import argparse
 import logging
 import os
+import signal
 from pathlib import Path
 import sys
 import threading
@@ -43,6 +44,12 @@ def main():
     print("关闭此进程即可停止服务。", flush=True)
     if args.open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+    def stop_service(signum, frame):
+        # systemd 默认发送 SIGTERM；复用正常退出流程，等待在途任务完成结算。
+        raise KeyboardInterrupt
+
+    previous_sigterm = signal.signal(signal.SIGTERM, stop_service)
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:
@@ -50,6 +57,7 @@ def main():
     finally:
         server.server_close()
         app.close()
+        signal.signal(signal.SIGTERM, previous_sigterm)
     return 0
 
 

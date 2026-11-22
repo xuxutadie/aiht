@@ -3,7 +3,7 @@
 import unittest
 
 from studio.contracts import DomainError
-from studio.plans import build_prompt, build_summary, missing_fields, sanitize_answers
+from studio.plans import build_prompt, build_preview, build_summary, missing_fields, sanitize_answers
 
 
 def complete_answers():
@@ -44,6 +44,49 @@ class PlansTests(unittest.TestCase):
         self.assertIn("给小鸟让路的城市", summary)
         self.assertIn("修改", summary)
         self.assertNotIn("获奖", summary)
+
+    def test_legacy_answers_and_auto_framing_keep_original_prompt(self):
+        answers = complete_answers()
+        self.assertEqual(missing_fields(answers), [])
+        self.assertEqual(build_prompt({**answers, "subject_framing": "自动", "scene_distance": "自动"}), build_prompt(answers))
+        for field, values in (("subject_framing", ("全身", "半身", "特写")),
+                              ("scene_distance", ("远景", "中景", "近景"))):
+            for value in values:
+                self.assertIn(value, build_prompt({**answers, field: value}))
+            with self.assertRaises(DomainError) as caught:
+                sanitize_answers({field: "其他"})
+            self.assertEqual(caught.exception.code, "invalid_choice")
+
+    def test_manual_prompt_limit_and_original_guidance_are_enforced(self):
+        answers = {**complete_answers(), "custom_prompt": "字" * 4000}
+        self.assertEqual(len(build_prompt(answers)), 4000)
+        with self.assertRaises(DomainError) as caught:
+            sanitize_answers({"custom_prompt": "字" * 4001})
+        self.assertEqual(caught.exception.code, "answer_too_long")
+        with self.assertRaises(DomainError) as caught:
+            build_prompt({**answers, "message": ""})
+        self.assertEqual(caught.exception.code, "incomplete_plan")
+
+    def test_empty_manual_prompt_can_be_a_draft_but_cannot_generate(self):
+        self.assertEqual(sanitize_answers({"custom_prompt": " \n "})["custom_prompt"], "")
+        with self.assertRaises(DomainError) as caught:
+            build_prompt({**complete_answers(), "custom_prompt": " \n "})
+        self.assertEqual(caught.exception.code, "empty_prompt")
+
+    def test_long_automatic_template_does_not_block_short_manual_prompt(self):
+        answers = {**complete_answers(), "custom_prompt": "我手动精简后的画面描述"}
+        for field in ("theme", "subject", "scene", "action", "details", "message", "message_detail", "innovation"):
+            answers[field] = "字" * 600
+        self.assertEqual(build_prompt(answers), answers["custom_prompt"])
+        preview = build_preview(answers)
+        self.assertEqual(preview["prompt"], answers["custom_prompt"])
+        self.assertEqual(preview["template_prompt"], "")
+        self.assertIn("精简", preview["template_error"])
+        self.assertEqual(preview["missing"], [])
+        del answers["custom_prompt"]
+        with self.assertRaises(DomainError) as caught:
+            build_prompt(answers)
+        self.assertEqual(caught.exception.code, "prompt_too_long")
 
 
 if __name__ == "__main__":

@@ -15,3 +15,10 @@ __pycache__/
 *.py[cod]
 *.log
 *.pid
+
+# Cloudflare 本地模拟、开发密钥与构建缓存
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+dist/

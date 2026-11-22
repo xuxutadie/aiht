@@ -1,4 +1,4 @@
-"""Seedream 5.0 Flash 单图适配器，仅使用 Python 标准库。
+"""固定服务商的单图适配器，仅使用 Python 标准库。
 
 参数依据：https://docs.volcengine.com/docs/ark/image-generation-api?lang=zh
 不自动重试：请求超时后可能已计费，需要管理员核对后处理预留算力。
@@ -8,6 +8,7 @@ import base64
 import binascii
 from dataclasses import dataclass
 import http.client
+import hmac
 import ipaddress
 import json
 import re
@@ -19,14 +20,17 @@ from urllib.parse import urlsplit
 import zlib
 
 from .contracts import DomainError
-from .secrets import validate_base_url, validate_model
+from .secrets import validate_base_url, validate_model, validate_quality, provider_from_base, config_fingerprint
 
 
-MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+# JSON中的base64会膨胀至原图的4/3，另留64KiB外壳；解码后仍限20MiB。
+MAX_RESPONSE_BYTES = 4 * ((MAX_IMAGE_BYTES + 2) // 3) + 64 * 1024
 TIMEOUT_SECONDS = 180
 RATIO_SIZES = {"1:1": "2048x2048", "4:3": "2368x1776", "3:4": "1776x2368",
                "16:9": "2816x1584", "9:16": "1584x2816"}
+HK_RATIO_SIZES = {"1:1": "1024x1024", "4:3": "1024x768", "3:4": "768x1024",
+                  "16:9": "1280x720", "9:16": "720x1280"}
 _DOWNLOAD_HOST = re.compile(r"(?:[a-z0-9-]+\.)+tos(?:-s)?-cn-[a-z0-9-]+\.volces\.com\Z")
 
 
@@ -112,13 +116,15 @@ def _read_limited(response, maximum):
     return b"".join(parts)
 
 
-def _safe_download_ips(url):
-    if not isinstance(url, str) or len(url) > 8192 or any(ord(char) <= 32 for char in url):
+def _safe_download_ips(url, provider="ark"):
+    if not isinstance(url, str) or len(url) > 8192 or "\\" in url or any(ord(char) <= 32 for char in url):
         raise ValueError("图片下载链接不合法")
     try:
         parsed = urlsplit(url)
         host = parsed.hostname or ""
-        if (parsed.scheme != "https" or not _DOWNLOAD_HOST.fullmatch(host)
+        allowed = (bool(_DOWNLOAD_HOST.fullmatch(host)) if provider == "ark"
+                   else provider == "openai-hk" and host == "myfile.addmao.com")
+        if (parsed.scheme != "https" or not allowed
                 or parsed.username is not None or parsed.password is not None
                 or parsed.port not in (None, 443) or parsed.fragment):
             raise ValueError("图片下载地址不在允许范围")
@@ -129,6 +135,24 @@ def _safe_download_ips(url):
         return ips
     except (OSError, TypeError):
         raise ValueError("无法验证图片地址") from None
+
+
+def _decode_image_base64(value):
+    """只接受标准base64或明确声明图片类型的data URI，不信任声明替代图片校验。"""
+    if not isinstance(value, str):
+        raise ValueError("图片编码格式不正确")
+    declared_mime = None
+    if value.startswith("data:"):
+        match = re.fullmatch(r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]*={0,2})", value)
+        if not match:
+            raise ValueError("图片data URI格式不正确")
+        declared_mime, value = match.groups()
+    if len(value) > 4 * ((MAX_IMAGE_BYTES + 2) // 3) or len(value) % 4:
+        raise ValueError("图片编码超过限制或格式不正确")
+    data = base64.b64decode(value, validate=True)
+    if len(data) > MAX_IMAGE_BYTES or base64.b64encode(data).decode("ascii") != value:
+        raise ValueError("图片编码超过限制或不规范")
+    return data, declared_mime
 
 
 def _dimensions(width, height):
@@ -258,9 +282,12 @@ class Provider:
             settings = self.settings.get()
             key = settings.get("api_key", "")
             if not key:
-                raise ProviderError("请先由管理员配置 Seedream API 密钥。")
+                raise ProviderError("请先由管理员配置绘图服务 API 密钥。")
             base_url = validate_base_url(settings["base_url"])
-            model = validate_model(settings["model"])
+            model = validate_model(settings["model"], base_url)
+            provider = provider_from_base(base_url)
+            quality = validate_quality(settings.get("quality", "low"))
+            fingerprint = config_fingerprint(settings)
         except DomainError:
             raise ProviderError("出图配置无法使用，请联系管理员检查设置。") from None
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 16000:
@@ -268,9 +295,21 @@ class Provider:
         if (not isinstance(options, dict) or not isinstance(options.get("ratio", "1:1"), str)
                 or options.get("ratio", "1:1") not in RATIO_SIZES):
             raise ProviderError("画面比例不受支持，请重新选择。")
-        payload = {"model": model, "prompt": prompt, "size": RATIO_SIZES[options.get("ratio", "1:1")],
-                   "output_format": "png", "response_format": "b64_json",
-                   "watermark": settings.get("watermark", True), "layer_decomposition": False}
+        expected = options.get("config_fingerprint")
+        if "config_fingerprint" in options:
+            if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected) or not hmac.compare_digest(expected, fingerprint):
+                raise ProviderError("绘图配置已变更，本次尚未调用模型，请重新确认方案后再生成。")
+        elif provider != "ark":
+            # 兼容升级前的Ark任务，但绝不能把这些旧任务默默转发给新服务商。
+            raise ProviderError("旧任务未记录当前绘图配置，本次尚未调用模型，请重新发起生成。")
+        if provider == "openai-hk":
+            payload = {"model": model, "prompt": prompt, "n": 1,
+                       "size": HK_RATIO_SIZES[options.get("ratio", "1:1")],
+                       "quality": quality, "response_format": "b64_json"}
+        else:
+            payload = {"model": model, "prompt": prompt, "size": RATIO_SIZES[options.get("ratio", "1:1")],
+                       "output_format": "png", "response_format": "b64_json",
+                       "watermark": settings.get("watermark", True), "layer_decomposition": False}
         try:
             encoded_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         except UnicodeError:
@@ -282,8 +321,8 @@ class Provider:
         try:
             with _open(req) as response:
                 request_id = _request_id(response.headers, key)
-                raw = _read_limited(response, MAX_RESPONSE_BYTES)
                 content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
+                raw = _read_limited(response, MAX_IMAGE_BYTES if content_type.startswith("image/") else MAX_RESPONSE_BYTES)
         except error.HTTPError as exc:
             request_id = _request_id(exc.headers, key)
             status = exc.code
@@ -301,6 +340,7 @@ class Provider:
                                 request_id=request_id) from None
         try:
             usage = {}
+            declared_mime = None
             if content_type.startswith("image/"):
                 image_data = raw
             else:
@@ -320,19 +360,18 @@ class Provider:
                     usage = {name: usage_raw[name] for name in ("generated_images", "input_images", "output_tokens", "total_tokens")
                              if type(usage_raw.get(name)) is int and 0 <= usage_raw[name] <= 10**12}
                 if entry.get("b64_json"):
-                    encoded = entry["b64_json"]
-                    if not isinstance(encoded, str) or len(encoded) > 4 * ((MAX_IMAGE_BYTES + 2) // 3):
-                        raise ValueError("图片编码超过限制")
-                    image_data = base64.b64decode(encoded, validate=True)
+                    image_data, declared_mime = _decode_image_base64(entry["b64_json"])
                 elif entry.get("url"):
                     url = entry["url"]
-                    ips = _safe_download_ips(url)
+                    ips = _safe_download_ips(url, provider)
                     # 下载请求不携带 API 密钥，且只连接已验证的公网地址。
                     with _open(request.Request(url, headers={"Accept": "image/png, image/jpeg, image/webp"}), pinned_ips=ips) as response:
                         image_data = _read_limited(response, MAX_IMAGE_BYTES)
                 else:
                     raise ValueError("响应中没有图片")
             mime, width, height = inspect_image(image_data)
+            if declared_mime is not None and declared_mime != mime:
+                raise ValueError("图片data URI类型与实际图片不一致")
             return GeneratedImage(image_data, mime, width, height, usage, request_id)
         except ProviderError:
             raise

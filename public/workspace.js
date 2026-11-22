@@ -12,6 +12,7 @@ export function createWorkspace(initialPlan, ctx) {
   let disposed = false;
   let pollTimer;
   let preview = null;
+  let manualPromptNeedsReview = false;
   let latestArtwork = null;
   let requestRecord = readRecord();
   // 刷新后的首次查询尚未返回时，先按已知状态锁住重复生成。
@@ -42,11 +43,21 @@ export function createWorkspace(initialPlan, ctx) {
       node.disabled = value || node.dataset.baseDisabled === '1';
     });
   }
+  function invalidateConfirmation(keepPreview = false) {
+    plan.confirmed = false;
+    if (!keepPreview) preview = null;
+    checks = [false, false, false];
+    // 输入期间保留文本框，只更新确认状态，避免光标跳动或旧勾选仍然显示。
+    checks.forEach((_, index) => { const checkbox = root.querySelector(`[name="check-${index}"]`); if (checkbox) checkbox.checked = false; });
+    const lock = root.querySelector('.workspace-lock');
+    if (lock) lock.textContent = '□ 完成并确认创作计划后解锁绘图';
+  }
   function updateAnswer(key, value) {
     answers[key] = value;
-    plan.confirmed = false;
-    preview = null;
-    checks = [false, false, false];
+    invalidateConfirmation(key === 'custom_prompt');
+    if (key !== 'custom_prompt' && Object.hasOwn(answers, 'custom_prompt')) manualPromptNeedsReview = true;
+    const review = root.querySelector('[data-prompt-review]');
+    if (review) review.textContent = promptReviewText();
     const summary = root.querySelector('[data-theme-summary]');
     if (summary) summary.textContent = answers.theme || '先选一个你关心的主题';
     status.replaceChildren(el('span', { className: 'save-status' }, '有未保存的修改'));
@@ -69,6 +80,7 @@ export function createWorkspace(initialPlan, ctx) {
     const missing = STEPS[step].fields.filter(([name, , , required]) => required && !String(answers[name] || '').trim()).map(field => field[0]);
     if (step === 3) ['ratio', 'style'].forEach(name => { if (!answers[name]) missing.push(name); });
     if (step === 4 && !answers.innovation_type) missing.push('innovation_type');
+    if (step === 4 && Object.hasOwn(answers, 'custom_prompt') && !answers.custom_prompt.trim()) missing.push('custom_prompt');
     markMissing(missing);
     return missing.length === 0;
   }
@@ -110,7 +122,12 @@ export function createWorkspace(initialPlan, ctx) {
       await save(step, false, true);
       preview = await post(`/api/plans/${encodeURIComponent(plan.id)}/preview`);
       if (preview.missing?.length) { render(); markMissing(preview.missing); return; }
-      await save(5, true);
+      const saved = await save(5, true);
+      if (!saved.confirmed) {
+        invalidateConfirmation(); render();
+        status.replaceChildren(notice('创作内容已发生变化，请重新检查并确认计划。', 'error'));
+        return;
+      }
       step = 5; render(); window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) { status.replaceChildren(notice(err.message, 'error')); }
     finally { setBusy(false); }
@@ -132,19 +149,76 @@ export function createWorkspace(initialPlan, ctx) {
     field.querySelector('input,textarea').addEventListener('input', event => updateAnswer(name, event.target.value));
     return field;
   }
-  function choiceField(name, label, options) {
-    const field = inputField({ name, label, options, value: answers[name] || '', required: true });
+  function choiceField(name, label, options, { required = true, hint, defaultValue = '' } = {}) {
+    const field = inputField({ name, label, options, value: answers[name] || defaultValue, required, hint });
     field.querySelector('select').addEventListener('change', event => {
       updateAnswer(name, event.target.value);
       if (name === 'innovation_type') root.querySelector('[data-innovation-question]').textContent = INNOVATION_QUESTIONS[event.target.value] || '';
     });
     return field;
   }
+  function promptReviewText() {
+    if (!Object.hasOwn(answers, 'custom_prompt')) return '提示词由当前回答整理。你可以直接改写，改写后会随草稿保存。';
+    return manualPromptNeedsReview
+      ? '前面的回答有改动，已保留你的手动提示词。请核对是否仍符合当前计划，再重新自查确认。'
+      : '已手动改写。最终生图将使用这段文字；请核对题目、表达和创新，修改后重新自查确认。';
+  }
+  async function restoreTemplatePrompt() {
+    if (busy) return;
+    if (!Object.hasOwn(answers, 'custom_prompt')) { await previewPlan(); return; }
+    let preservedCustom = answers.custom_prompt;
+    setBusy(true);
+    invalidateConfirmation(true);
+    try {
+      // 先保留手写稿并检查当前模板，避免恢复时才发现原回答不完整或模板超长。
+      await save(step, false, true);
+      preservedCustom = answers.custom_prompt;
+      preview = await post(`/api/plans/${encodeURIComponent(plan.id)}/preview`);
+      if (preview.template_error || !preview.template_prompt) {
+        render();
+        status.replaceChildren(notice(preview.template_error || '请先补全前面的回答，再恢复提示词。你的手动内容已保留。', 'error'));
+        return;
+      }
+      // 只有明确点击恢复且模板可用时才移除字段；空白输入不会静默回退。
+      delete answers.custom_prompt;
+      manualPromptNeedsReview = false;
+      await save(step, false, true);
+      preview = { ...preview, prompt: preview.template_prompt, prompt_mode: 'template', missing: [] };
+      render();
+    } catch (err) {
+      answers.custom_prompt = preservedCustom;
+      render();
+      status.replaceChildren(notice(`恢复未完成，已保留你的手动提示词。${err.message}`, 'error'));
+    } finally { setBusy(false); }
+  }
+  function promptEditor() {
+    const custom = Object.hasOwn(answers, 'custom_prompt');
+    const value = custom ? answers.custom_prompt : preview?.prompt || preview?.template_prompt || '';
+    const field = inputField({ name: 'custom_prompt', label: '绘图提示词（可以手动改写）', multiline: true, value, rows: 8, maxlength: 4000 });
+    const count = el('p', { className: 'muted', 'data-prompt-count': true }, `${[...value].length} / 4000 字`);
+    const editor = field.querySelector('textarea');
+    editor.addEventListener('input', event => {
+      updateAnswer('custom_prompt', event.target.value);
+      if (preview) { preview.prompt = event.target.value; preview.prompt_mode = 'custom'; }
+      count.textContent = `${[...event.target.value].length} / 4000 字`;
+    });
+    return el('section', { className: 'prompt-preview' }, el('h3', {}, '提示词预览与改写'),
+      el('p', { className: 'muted', 'data-prompt-review': true }, promptReviewText()),
+      preview?.missing?.length ? notice(`还有 ${preview.missing.length} 项待补充，请完善后再确认。`, 'error')
+        : preview ? notice('所需内容已齐全，请核对提示词并完成自查。', 'success') : notice('已保留你保存的提示词。确认前请点击“检查计划并预览提示词”。'),
+      field, count,
+      el('p', { className: 'muted' }, '实际图片比例仍按“设计画面”里的选择设置；想改画幅时，请同时修改画面比例。'),
+      button('根据当前回答恢复提示词', restoreTemplatePrompt, 'button secondary', { 'data-work-action': true }));
+  }
   function planningContent() {
     const body = el('div', { className: 'step-card-body' });
     body.append(el('p', { className: 'step-intro' }, STEPS[step].intro));
     if (step === 3) {
-      body.append(...STEPS[step].fields.slice(0, 4).map(makeField), el('div', { className: 'field-pair' }, choiceField('ratio', '画面比例', ['1:1', '4:3', '3:4', '16:9', '9:16']), choiceField('style', '画面风格', ['动漫', '写实', '水彩', '拼贴', '版画'])), makeField(STEPS[step].fields[4]));
+      body.append(...STEPS[step].fields.slice(0, 4).map(makeField),
+        el('div', { className: 'field-pair' },
+          choiceField('subject_framing', '主体展示范围', ['自动', '全身', '半身', '特写'], { required: false, defaultValue: '自动', hint: '全身：展示完整主体；半身：突出上半身；特写：放大面部或局部。不是人物也可选择“自动”。' }),
+          choiceField('scene_distance', '场景景别', ['自动', '远景', '中景', '近景'], { required: false, defaultValue: '自动', hint: '远景：展示更多环境；中景：兼顾主体与环境；近景：让主体更突出、环境更少。' })),
+        el('div', { className: 'field-pair' }, choiceField('ratio', '画面比例', ['1:1', '4:3', '3:4', '16:9', '9:16']), choiceField('style', '画面风格', ['动漫', '写实', '水彩', '拼贴', '版画'])), makeField(STEPS[step].fields[4]));
     } else {
       if (step === 4) body.append(choiceField('innovation_type', '选择一个创新方向', Object.keys(INNOVATION_QUESTIONS)), el('p', { className: 'preset-question', 'data-innovation-question': true }, INNOVATION_QUESTIONS[answers.innovation_type] || INNOVATION_QUESTIONS['新的组合']));
       body.append(...STEPS[step].fields.map(makeField));
@@ -152,7 +226,7 @@ export function createWorkspace(initialPlan, ctx) {
     if (step === 4) {
       body.append(el('div', { className: 'self-check' }, el('h3', {}, '生成前，自己检查一次'), ...['我已核对题目要求，作品围绕自己确定的主题。', '我的表达与创新，都能在画面细节里找到。', '这些内容是我自己的想法，我能说明为什么这样设计。'].map((text, index) => el('label', { className: 'check-label' }, el('input', { type: 'checkbox', name: `check-${index}`, checked: checks[index], onChange: event => { checks[index] = event.target.checked; } }), el('span', {}, text)))));
       body.append(button('检查计划并预览提示词', previewPlan, 'button secondary', { 'data-work-action': true }));
-      if (preview) body.append(el('section', { className: 'prompt-preview' }, el('h3', {}, '提示词预览'), el('p', { className: 'muted' }, '这是根据你的回答整理的画面描述，请核对是否表达了你的想法。要调整内容，请回到对应步骤修改。'), preview.missing?.length ? notice(`还有 ${preview.missing.length} 项待补充，请返回对应步骤完善。`, 'error') : notice('所需内容已齐全，可以自查确认。', 'success'), inputField({ name: 'prompt-preview', label: '整理后的绘图提示词（只读）', multiline: true, value: preview.prompt || '', rows: 8, readOnly: true })));
+      if (preview || Object.hasOwn(answers, 'custom_prompt')) body.append(promptEditor());
     }
     body.append(button('给我一点提示', () => { const hint = root.querySelector('.thinking-card'); if (hint) { hintOpen = true; hint.open = true; hint.scrollIntoView({ behavior: 'smooth', block: 'center' }); hint.querySelector('summary')?.focus({ preventScroll: true }); } }, 'text-button'));
     return body;
@@ -200,7 +274,8 @@ export function createWorkspace(initialPlan, ctx) {
     root.querySelector('[data-generate]')?.setAttribute('disabled', '');
     try {
       if (!recover) {
-        await save(5, true, true);
+        const saved = await save(5, true, true);
+        if (!saved.confirmed) throw new Error('创作内容已发生变化，请回到第 5 步重新检查并确认。');
         job = null;
         latestArtwork = null;
         record({ plan_id: plan.id, request_key: crypto.randomUUID(), status: 'requesting' });
@@ -217,15 +292,15 @@ export function createWorkspace(initialPlan, ctx) {
       const insufficientCredits = String(err.code).toLowerCase() === 'insufficient_credits';
       // 网络异常可能发生在服务端已受理之后，仅允许用同一请求号核对。
       // 余额不足是明确未受理，即使状态码为 409，也不能标成结果未知。
-      if (insufficientCredits || (!recover && err.status >= 400 && err.status < 500 && err.status !== 409)) {
+      if (insufficientCredits || err.code === 'storage_capacity' || (!recover && err.status >= 400 && err.status < 500 && err.status !== 409)) {
         record({ ...requestRecord, status: 'rejected' });
       }
       if (disposed) return;
       let refreshError = null;
-      if (insufficientCredits) {
+      if (insufficientCredits || err.code === 'storage_capacity') {
         job = previousGeneration.job;
         latestArtwork = previousGeneration.artwork;
-        try { await refreshCredits(); }
+        try { if (insufficientCredits) await refreshCredits(); }
         catch (balanceError) { refreshError = balanceError; }
       }
       if (disposed) return;
