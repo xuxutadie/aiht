@@ -1,5 +1,6 @@
 // 云端版保持现有网页接口及算力含义，统一可公开的错误格式。
 export const INITIAL_CREDITS = 10;
+export const ADMIN_UNLIMITED_RESERVE_NOTE = '管理员无限算力，无需预留点数';
 export const COOKIE_NAME = 'creation_session';
 export const SESSION_SECONDS = 7 * 24 * 60 * 60;
 export const MODEL_DEFAULT = 'doubao-seedream-5-0-flash-260915';

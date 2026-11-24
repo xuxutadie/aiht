@@ -58,12 +58,14 @@ class Store(GenerationStore, Database):
                     if code is None:
                         raise DomainError(400, "invalid_authorization_code", "授权码无效或已使用，请联系老师获取有效授权码。")
                 timestamp = now()
+                initial_credits = INITIAL_CREDITS if role == "student" else 0
                 connection.execute("""INSERT INTO users
                     (id,name,phone,region,school,grade,role,password_hash,credits,reserved_credits,created_at)
                     VALUES (?,?,?,?,?,?,?,?,?,0,?)""",
                     (user_id, values["name"], values["phone"], values["region"], values["school"],
-                     values["grade"], role, encoded, INITIAL_CREDITS, timestamp))
-                self._ledger_in(connection, user_id, "grant", INITIAL_CREDITS, None, "首次注册赠送10点算力")
+                     values["grade"], role, encoded, initial_credits, timestamp))
+                self._ledger_in(connection, user_id, "grant", initial_credits, None,
+                                "首次注册赠送10点算力" if role == "student" else "管理员享有无限算力")
                 if role == "student":
                     # 与开户和赠送共用写事务；任一步失败会一并回滚，不能耗掉授权码。
                     connection.execute("UPDATE authorization_codes SET used_by = ?, used_at = ? WHERE id = ?",

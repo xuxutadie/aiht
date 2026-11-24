@@ -10,7 +10,7 @@ import { hashInRuntime, verifyInRuntime, getRuntimeImage } from './runtime-servi
 import { FRONTEND_SCRIPT_HASH, FRONTEND_STYLE_HASH } from '../.wrangler/frontend-policy.js';
 
 const BODY_LIMIT = 65536;
-const USER_FIELDS = ['id', 'name', 'phone', 'region', 'school', 'grade', 'role', 'credits', 'reserved_credits', 'available_credits', 'created_at'];
+const USER_FIELDS = ['id', 'name', 'phone', 'region', 'school', 'grade', 'role', 'credits', 'reserved_credits', 'available_credits', 'unlimited_credits', 'created_at'];
 // 不存在的账号也执行同等密码校验，避免通过运算时间判断手机号是否注册。
 const DUMMY_PASSWORD_HASH = `scrypt$16384$8$1$${'00'.repeat(16)}$${'00'.repeat(32)}`;
 
@@ -284,7 +284,7 @@ async function apiResponse(request, url, route, env) {
     if (path === 'admin/overview' && method === 'GET') {
       const users = (await store.listUsers()).map(publicUser);
       const uncertain = await store.listUncertainJobs();
-      return jsonResponse(200, { users, uncertain_jobs: uncertain, stats: { users: users.length, uncertain_jobs: uncertain.length, remaining_credits: users.reduce((sum, account) => sum + account.credits, 0) } });
+      return jsonResponse(200, { users, uncertain_jobs: uncertain, stats: { users: users.length, uncertain_jobs: uncertain.length, remaining_credits: users.filter(account => account.role === 'student').reduce((sum, account) => sum + account.credits, 0) } });
     }
     if (route.length === 4 && route[1] === 'jobs' && route[3] === 'resolve' && method === 'POST') {
       if (typeof body.consume !== 'boolean') throw new DomainError(400, 'invalid_decision', '请选择实际核对结果。');

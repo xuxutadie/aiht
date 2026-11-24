@@ -7,10 +7,15 @@ export function creditBalance(user) {
   const total = Number(user?.credits);
   const available = Number(user?.available_credits ?? user?.credits);
   const reserved = Number(user?.reserved_credits || 0);
+  // 新接口明确返回管理员无限算力，兼容尚未更新的旧接口。
+  const unlimited = user?.unlimited_credits ?? (user?.role === 'admin');
   return {
-    total, available, reserved,
-    exhausted: Number.isFinite(total) && total <= 0,
-    fullyReserved: total > 0 && available <= 0 && reserved > 0,
+    total, available, reserved, unlimited,
+    canGenerate: unlimited || available > 0,
+    availableText: unlimited ? '无限' : `${available} 点`,
+    reservedText: unlimited ? (reserved ? `${reserved} 点（历史）` : '无需预留') : `${reserved} 点`,
+    exhausted: !unlimited && Number.isFinite(total) && total <= 0,
+    fullyReserved: !unlimited && total > 0 && available <= 0 && reserved > 0,
   };
 }
 

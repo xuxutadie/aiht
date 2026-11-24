@@ -203,6 +203,40 @@ class MigrationTests(unittest.TestCase):
         with self.assertRaisesRegex(MigrationError, "账本"):
             migrate_d1(self.export(), self.destination)
 
+    def test_admin_unlimited_generation_and_manual_settlement_keep_zero_delta(self):
+        # 合成新版管理员快照：出图与人工确认成功均不影响数字余额。
+        self.source.execute("UPDATE users SET role='admin', credits=0 WHERE id=?", (USER,))
+        self.source.execute("UPDATE ledger SET delta=0, balance_after=0")
+        self.source.execute("UPDATE ledger SET note=? WHERE kind='reserve'", ("管理员无限算力，无需预留点数",))
+        settled = "e" * 32
+        self.source.execute("""INSERT INTO jobs
+            (id,user_id,plan_id,request_key,prompt,options,snapshot_answers,snapshot_title,status,
+             reservation_active,storage_reservation_bytes,error_message,artwork_id,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,'settled',0,0,NULL,NULL,?,?)""",
+                            (settled, USER, PLAN, "admin-manual", "测试", '{}', '{}', "测试", STAMP, STAMP))
+        for kind, note in (("reserve", "管理员无限算力，无需预留点数"), ("freeze", "待核对"),
+                           ("manual_consume", "确认成功，不扣点")):
+            self.source.execute("INSERT INTO ledger VALUES (?,?,?,?,?,?,?,?)",
+                                ("admin-" + kind, USER, kind, 0, 0, settled, note, STAMP))
+        self.source.execute("INSERT INTO audit VALUES (?,?,?,?,?,?)",
+                            ("audit-admin", settled, USER, 1, "确认生成成功", STAMP))
+        source = self.export()
+        report = migrate_d1(source, self.destination)
+        self.assertEqual(report["credits_total"], 0)
+        self.assertEqual(report["counts"]["audit"], 1)
+        self.assertTrue(verify_migration(source, self.destination)["verified"])
+        store = Store(self.destination / "creation.sqlite3")
+        self.assertEqual(store.get_user(USER)["credits"], 0)
+        self.assertEqual(store.get_job(USER, JOB)["status"], "succeeded")
+        self.assertTrue(all(entry["delta"] == 0 for entry in store.ledger(USER)))
+
+    def test_student_cannot_use_admin_unlimited_marker_even_if_balance_matches(self):
+        self.source.execute("UPDATE users SET credits=10 WHERE id=?", (USER,))
+        self.source.execute("UPDATE ledger SET delta=0, balance_after=10 WHERE kind='consume'")
+        self.source.execute("UPDATE ledger SET note=? WHERE kind='reserve'", ("管理员无限算力，无需预留点数",))
+        with self.assertRaisesRegex(MigrationError, "账本"):
+            migrate_d1(self.export(), self.destination)
+
     def test_rejects_missing_reservation_history_even_when_balance_matches(self):
         self.source.execute("DELETE FROM ledger WHERE kind='reserve'")
         with self.assertRaisesRegex(MigrationError, "账本"):

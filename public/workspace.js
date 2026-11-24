@@ -16,7 +16,7 @@ export function createWorkspace(initialPlan, ctx) {
   let latestArtwork = null;
   let requestRecord = readRecord();
   // 刷新后的首次查询尚未返回时，先按已知状态锁住重复生成。
-  let job = requestRecord?.job_id ? { id: requestRecord.job_id, status: ['succeeded', 'failed', 'settled', 'uncertain'].includes(requestRecord.status) ? requestRecord.status : 'running' } : null;
+  let job = requestRecord?.job_id ? { id: requestRecord.job_id, status: ['succeeded', 'failed', 'settled', 'uncertain'].includes(requestRecord.status) ? requestRecord.status : 'running', unlimited_credits: requestRecord.unlimited_credits } : null;
   let checks = plan.confirmed ? [true, true, true] : [false, false, false];
   const mobileHintQuery = window.matchMedia('(max-width: 720px)');
   let hintOpen = !mobileHintQuery.matches;
@@ -233,8 +233,8 @@ export function createWorkspace(initialPlan, ctx) {
   }
   function generationContent() {
     const body = el('div', { className: 'step-card-body generation-body' });
-    body.append(el('p', { className: 'step-intro' }, STEPS[5].intro), el('div', { className: 'generation-balance' }, el('span', {}, '本次生成 ', el('strong', {}, '1 张')), el('span', {}, '剩余算力 ', el('strong', {}, `${ctx.user.available_credits ?? ctx.user.credits}`), ' 点'), el('span', {}, '预留 ', el('strong', {}, `${ctx.user.reserved_credits || 0}`), ' 点')));
     const balance = creditBalance(ctx.user);
+    body.append(el('p', { className: 'step-intro' }, balance.unlimited ? '每次生成 1 张图片。管理员拥有无限平台算力，生成时无需预留或扣除点数。' : STEPS[5].intro), el('div', { className: 'generation-balance' }, el('span', {}, '本次生成 ', el('strong', {}, '1 张')), el('span', {}, '剩余算力 ', el('strong', {}, balance.availableText)), el('span', {}, '预留 ', el('strong', {}, balance.reservedText))));
     if (balance.exhausted) body.append(notice(`剩余算力为 0 点。${EXHAUSTED_MESSAGE}。你仍可以保存草稿、查看并下载已有作品。`, 'warning'));
     else if (balance.fullyReserved) body.append(notice('当前算力已全部预留，请等待生成结果或联系老师核对。你仍可以保存草稿、查看并下载已有作品。', 'warning'));
     if (!plan.confirmed) body.append(notice('你修改过创作计划，请回到第 5 步重新检查并确认。', 'error'), button('回到提炼创新', () => goStep(4), 'button secondary', { 'data-work-action': true }));
@@ -251,7 +251,9 @@ export function createWorkspace(initialPlan, ctx) {
     const active = job && ['queued', 'running'].includes(job.status);
     if (pendingWithoutJob) body.append(notice('上次请求的结果尚未确定。请先核对，暂时不要发起新的生成。若核对失败，请联系老师查看任务，也可以到“我的作品”查看是否已保存图片。', 'warning'), button('核对上次请求（不会重复消耗算力）', () => startGeneration(true), 'button secondary', { 'data-work-action': true }));
     if (job) {
-      const text = { queued: '任务已排队，正在等待绘图。请勿重复提交。', running: '正在生成作品，图片完成后会自动保存在“我的作品”。', succeeded: '作品已生成并保存，本次消耗 1 点算力。', failed: '本次生成未成功，不消耗算力，预留的 1 点算力已释放。你可以检查计划后重试。', uncertain: '上游结果尚不确定，1 点算力暂时预留。请联系老师核对，核对完成前不要重复生成。', settled: '老师已核对这项任务。请到算力记录查看处理结果。' }[job.status] || '任务状态正在核对。';
+      // 任务结算模式与账户当前额度分开：更新前的管理员任务仍按原记录结算。
+      const freeJob = job.unlimited_credits === true;
+      const text = { queued: '任务已排队，正在等待绘图。请勿重复提交。', running: '正在生成作品，图片完成后会自动保存在“我的作品”。', succeeded: freeJob ? '作品已生成并保存，本次不消耗算力。' : '作品已生成并保存，本次消耗 1 点算力。', failed: freeJob ? '本次生成未成功，不消耗算力。你可以检查计划后重试。' : '本次生成未成功，不消耗算力，预留的 1 点算力已释放。你可以检查计划后重试。', uncertain: freeJob ? '上游结果尚不确定，本任务不预留算力。请核对结果，核对完成前不要重复生成。' : '上游结果尚不确定，1 点算力暂时预留。请联系老师核对，核对完成前不要重复生成。', settled: '老师已核对这项任务。请到算力记录查看处理结果。' }[job.status] || '任务状态正在核对。';
       body.append(notice(text, job.status === 'failed' ? 'error' : job.status === 'uncertain' ? 'warning' : job.status === 'succeeded' ? 'success' : 'info'));
       if (job.error_message) body.append(el('p', { className: 'muted' }, job.error_message));
       if (active) body.append(el('div', { className: 'job-progress', role: 'status' }, el('span', { className: 'progress-dot', 'aria-hidden': true }), '正在等待绘图服务，请保留此页面…'));
@@ -260,15 +262,15 @@ export function createWorkspace(initialPlan, ctx) {
     if (latestArtwork) body.append(el('figure', { className: 'generated-artwork' }, el('img', { src: `/api/artworks/${encodeURIComponent(latestArtwork.id)}/image`, alt: latestArtwork.title || '本次生成的作品' }), el('figcaption', {}, '对照计划看一看：画面表达了你的意思吗？')), el('div', { className: 'button-row' }, button('写作品说明', () => goStep(6), 'button primary', { 'data-work-action': true }), el('a', { className: 'button secondary', href: `/api/artworks/${encodeURIComponent(latestArtwork.id)}/download`, download: '' }, '下载原图')));
     const mayGenerate = !job || ['failed', 'succeeded', 'settled'].includes(job.status);
     if (!pendingWithoutJob && !active && mayGenerate) {
-      const available = Number(ctx.user.available_credits ?? ctx.user.credits);
-      body.append(button(job?.status === 'failed' ? '确认重试 1 张（成功消耗 1 点）' : latestArtwork ? '再生成 1 张（成功消耗 1 点）' : '确认生成 1 张（成功消耗 1 点）', () => startGeneration(false), 'button primary generation-submit', { disabled: !ctx.configured || !plan.confirmed || available <= 0, 'data-generate': true }));
+      const action = job?.status === 'failed' ? '确认重试 1 张' : latestArtwork ? '再生成 1 张' : '确认生成 1 张';
+      body.append(button(`${action}（${balance.unlimited ? '不扣算力' : '成功消耗 1 点'}）`, () => startGeneration(false), 'button primary generation-submit', { disabled: !ctx.configured || !plan.confirmed || !balance.canGenerate, 'data-generate': true }));
     }
     return body;
   }
   async function startGeneration(recover = false) {
     if (busy) return;
     if (!recover && (['queued', 'running', 'uncertain'].includes(job?.status) || requestRecord?.status === 'requesting')) return;
-    if (!recover && (!plan.confirmed || !ctx.configured || Number(ctx.user.available_credits ?? ctx.user.credits) <= 0)) return;
+    if (!recover && (!plan.confirmed || !ctx.configured || !creditBalance(ctx.user).canGenerate)) return;
     const previousGeneration = { job, artwork: latestArtwork };
     setBusy(true);
     root.querySelector('[data-generate]')?.setAttribute('disabled', '');
@@ -282,7 +284,7 @@ export function createWorkspace(initialPlan, ctx) {
       }
       const data = await post('/api/generate', { plan_id: plan.id, request_key: requestRecord.request_key });
       job = data.job;
-      record({ ...requestRecord, job_id: job.id, status: job.status });
+      record({ ...requestRecord, job_id: job.id, status: job.status, unlimited_credits: job.unlimited_credits });
       if (disposed) return;
       ctx.onUser(data.user);
       render();
@@ -327,7 +329,7 @@ export function createWorkspace(initialPlan, ctx) {
     try {
       const data = await api(`/api/jobs/${encodeURIComponent(requestRecord.job_id)}`);
       if (disposed) return;
-      job = data.job; ctx.onUser(data.user); record({ ...requestRecord, status: job.status }); render();
+      job = data.job; ctx.onUser(data.user); record({ ...requestRecord, status: job.status, unlimited_credits: job.unlimited_credits }); render();
       if (['queued', 'running'].includes(job.status)) schedulePoll(); else await loadJobArtwork();
     } catch (err) {
       if (!disposed) status.replaceChildren(notice(`任务查询暂时中断。${err.message} 不会自动重新生成。`, 'warning'), button('继续查询任务', pollJob, 'button secondary'));
@@ -345,7 +347,9 @@ export function createWorkspace(initialPlan, ctx) {
     else if (step === 4) footer.append(button('确认计划，进入生成', confirmPlan, 'button primary', { 'data-work-action': true }));
     else if (step === 5) footer.append(button(latestArtwork ? '下一步，写作品说明' : '保存草稿', latestArtwork ? () => goStep(6) : saveDraft, 'button primary', { 'data-work-action': true }));
     else footer.append(button('查看我的作品', ctx.onOpenGallery, 'button primary', { 'data-work-action': true }));
-    root.replaceChildren(el('div', { className: 'mobile-step-heading' }, el('strong', {}, el('span', {}, `第 ${step + 1} 步 / 共 7 步`), el('small', { className: 'mobile-credit-summary' }, `剩余算力 ${ctx.user.available_credits ?? ctx.user.credits} 点${ctx.user.reserved_credits ? `（预留 ${ctx.user.reserved_credits} 点）` : ''}`)), button(`${STEPS[step].name} ▾`, showSteps, 'text-button', { 'aria-label': `查看步骤，当前${STEPS[step].name}` })), el('div', { className: 'workspace-title' }, el('span', { className: 'eyebrow blue' }, `练习任务：${answers.theme || answers.competition_theme || '我的创作计划'}`), el('h1', {}, '先把想法，说得清清楚楚。')), stepsList(), status, el('div', { className: 'workspace-columns' }, card, el('aside', { className: 'workspace-aside' }, el('details', { className: 'thinking-card card', open: hintOpen, onToggle: event => { if (event.target.isConnected) hintOpen = event.target.open; } }, el('summary', { className: 'aside-heading' }, el('h3', { className: 'chip yellow' }, '想一想'), el('span', { className: 'idea-symbol', 'aria-hidden': true }, '！')), el('p', {}, STEPS[step].hint)), el('section', { className: 'theme-card card' }, el('h3', { className: 'chip mint' }, '我的主题'), el('p', { 'data-theme-summary': true }, answers.theme || '先选一个你关心的主题')), el('section', { className: 'rule-note' }, el('strong', {}, '我的想法 · 自己表达'), el('p', {}, '提示帮助你想清楚，表达由你来完成。填写和保存计划不消耗算力。')))), footer, el('p', { className: 'workspace-lock' }, plan.confirmed ? '✓ 创作计划已确认，可以由你决定何时生成' : '□ 完成并确认创作计划后解锁绘图'));
+    const balance = creditBalance(ctx.user);
+    const mobileCredit = `剩余算力 ${balance.availableText}${balance.reserved ? `（${balance.unlimited ? '历史' : ''}预留 ${balance.reserved} 点）` : ''}`;
+    root.replaceChildren(el('div', { className: 'mobile-step-heading' }, el('strong', {}, el('span', {}, `第 ${step + 1} 步 / 共 7 步`), el('small', { className: 'mobile-credit-summary' }, mobileCredit)), button(`${STEPS[step].name} ▾`, showSteps, 'text-button', { 'aria-label': `查看步骤，当前${STEPS[step].name}` })), el('div', { className: 'workspace-title' }, el('span', { className: 'eyebrow blue' }, `练习任务：${answers.theme || answers.competition_theme || '我的创作计划'}`), el('h1', {}, '先把想法，说得清清楚楚。')), stepsList(), status, el('div', { className: 'workspace-columns' }, card, el('aside', { className: 'workspace-aside' }, el('details', { className: 'thinking-card card', open: hintOpen, onToggle: event => { if (event.target.isConnected) hintOpen = event.target.open; } }, el('summary', { className: 'aside-heading' }, el('h3', { className: 'chip yellow' }, '想一想'), el('span', { className: 'idea-symbol', 'aria-hidden': true }, '！')), el('p', {}, STEPS[step].hint)), el('section', { className: 'theme-card card' }, el('h3', { className: 'chip mint' }, '我的主题'), el('p', { 'data-theme-summary': true }, answers.theme || '先选一个你关心的主题')), el('section', { className: 'rule-note' }, el('strong', {}, '我的想法 · 自己表达'), el('p', {}, '提示帮助你想清楚，表达由你来完成。填写和保存计划不消耗算力。')))), footer, el('p', { className: 'workspace-lock' }, plan.confirmed ? '✓ 创作计划已确认，可以由你决定何时生成' : '□ 完成并确认创作计划后解锁绘图'));
     if (busy) setBusy(true);
   }
 

@@ -6,6 +6,7 @@ import os
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 INITIAL_CREDITS = 10
+ADMIN_UNLIMITED_RESERVE_NOTE = "管理员无限算力，无需预留点数"
 COOKIE_NAME = "creation_session"
 SESSION_SECONDS = 7 * 24 * 60 * 60
 MODEL_DEFAULT = "doubao-seedream-5-0-flash-260915"

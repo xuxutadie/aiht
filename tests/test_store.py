@@ -55,6 +55,82 @@ class StoreTests(unittest.TestCase):
     def admin(self):
         return self._admin
 
+    def reserve_admin(self, key):
+        admin_id = self.admin()["id"]
+        plan = self.store.create_plan(admin_id, "指导创作", {"theme": "绿色"})
+        plan = self.store.save_plan(admin_id, plan["id"], plan["answers"], 4, True)
+        return self.store.reserve_generation(admin_id, plan["id"], key,
+                                             "画一座绿色城市", {"ratio": "1:1"})
+
+    def test_admin_has_unlimited_credits_without_numeric_grant_or_deduction(self):
+        admin_id = self.admin()["id"]
+        self.assertTrue(self.admin()["unlimited_credits"])
+        self.assertFalse(self.user["unlimited_credits"])
+        self.assertEqual(self.admin()["credits"], 0)
+        for index in range(12):
+            job = self.reserve_admin(f"admin-{index}")
+            self.assertTrue(job["unlimited_credits"])
+            self.assertTrue(self.store.get_job_by_request(admin_id, f"admin-{index}")["unlimited_credits"])
+            self.assertEqual(self.store.get_user(admin_id)["reserved_credits"], 0)
+            self.store.mark_job_running(job["id"])
+            first = self.store.complete_generation(job["id"], self.artifact())
+            repeated = self.store.complete_generation(job["id"], self.artifact())
+            self.store.fail_generation(job["id"], "迟到的失败")
+            self.assertEqual(first["id"], repeated["id"])
+            self.assertTrue(self.store.get_job(admin_id, job["id"])["unlimited_credits"])
+        entries = self.store.ledger(admin_id)
+        self.assertTrue(all(entry["delta"] == 0 and entry["balance_after"] == 0 for entry in entries))
+        self.assertEqual(sum(entry["kind"] == "consume" for entry in entries), 12)
+        self.assertEqual(sum(entry["kind"] == "reserve" for entry in entries), 12)
+        self.assertEqual(self.store.get_user(admin_id)["credits"], 0)
+
+    def test_admin_fail_restart_and_manual_settlement_never_change_numeric_balance(self):
+        admin_id = self.admin()["id"]
+        failed = self.reserve_admin("admin-fail")
+        self.store.fail_generation(failed["id"], "明确失败")
+        self.store.fail_generation(failed["id"], "重复")
+        uncertain = self.reserve_admin("admin-uncertain")
+        self.store.fail_generation(uncertain["id"], "等待核对", uncertain=True)
+        interrupted = self.reserve_admin("admin-restart")
+        self.store.mark_job_running(interrupted["id"])
+        reopened = Store(self.db_path)
+        reopened.mark_interrupted_jobs_uncertain()
+        reopened.mark_interrupted_jobs_uncertain()
+        self.assertTrue(all(job["unlimited_credits"] for job in reopened.list_uncertain_jobs()))
+        reopened.resolve_uncertain_job(uncertain["id"], True, admin_id, "确实生成")
+        reopened.resolve_uncertain_job(interrupted["id"], False, admin_id, "没有生成")
+        self.assert_error(409, lambda: reopened.resolve_uncertain_job(uncertain["id"], True, admin_id, "重复"))
+        self.assertEqual((reopened.get_user(admin_id)["credits"], reopened.get_user(admin_id)["reserved_credits"]), (0, 0))
+        self.assertTrue(all(entry["delta"] == 0 for entry in reopened.ledger(admin_id)))
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(dict(connection.execute("SELECT job_id, consume FROM audit")),
+                             {uncertain["id"]: 1, interrupted["id"]: 0})
+
+    def test_historical_admin_reservations_settle_at_previous_policy(self):
+        admin_id = self.admin()["id"]
+        # 临时数据库中模拟升级前已有的预留任务，兼容三种旧任务结算方式。
+        legacy_one = self.reserve_admin("legacy-success")
+        legacy_two = self.reserve_admin("legacy-failure")
+        legacy_three = self.reserve_admin("legacy-uncertain")
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            connection.execute("UPDATE users SET credits=10,reserved_credits=3 WHERE id=?", (admin_id,))
+            connection.execute("UPDATE ledger SET delta=10,balance_after=10,note='首次注册赠送10点算力' WHERE user_id=? AND kind='grant'", (admin_id,))
+            connection.execute("UPDATE ledger SET balance_after=10,note='已预留1点算力，生成成功后扣除' WHERE job_id IN (?,?,?)",
+                               (legacy_one["id"], legacy_two["id"], legacy_three["id"]))
+        new_job = self.reserve_admin("after-upgrade")
+        self.assertFalse(self.store.get_job(admin_id, legacy_one["id"])["unlimited_credits"])
+        self.assertTrue(new_job["unlimited_credits"])
+        self.store.complete_generation(new_job["id"], self.artifact())
+        self.assertEqual(self.store.get_user(admin_id)["reserved_credits"], 3)
+        self.store.complete_generation(legacy_one["id"], self.artifact())
+        self.store.fail_generation(legacy_two["id"], "旧任务失败")
+        self.store.fail_generation(legacy_three["id"], "旧任务待核对", uncertain=True)
+        self.store.resolve_uncertain_job(legacy_three["id"], True, admin_id, "已生成")
+        user = self.store.get_user(admin_id)
+        self.assertTrue(user["unlimited_credits"])
+        self.assertEqual((user["credits"], user["reserved_credits"]), (8, 0))
+        self.assertEqual(sum(entry["delta"] for entry in self.store.ledger(admin_id)), 8)
+
     def test_registration_grants_once_and_duplicate_phone_cannot_grant_again(self):
         self.assertEqual(self.user["credits"], 10)
         self.assertEqual(self.user["reserved_credits"], 0)

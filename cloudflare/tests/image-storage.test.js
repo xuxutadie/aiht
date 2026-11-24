@@ -102,6 +102,11 @@ test('存储预算包含其他任务预留，满额时不创建新任务或改�
   assert.equal((await f.store.ledger(other.id)).length, entries);
   const reserved = await f.db.prepare('SELECT SUM(storage_reservation_bytes) AS n FROM jobs').first('n');
   assert.ok(reserved <= IMAGE_STORAGE_BUDGET);
+  const admin = await createTestAdmin(f.store);
+  let adminPlan = await f.store.createPlan(admin.id, '管理员测试', { theme: '测试' });
+  adminPlan = await f.store.savePlan(admin.id, adminPlan.id, { title: '管理员测试', answers: adminPlan.answers, step: 5, confirmed: true });
+  await assert.rejects(f.store.reserveGeneration(admin.id, adminPlan.id, newId(), '测试', {}, adminPlan.revision), error => error.code === 'storage_capacity');
+  assert.equal((await f.store.ledger(admin.id)).length, 1);
   await f.store.failGeneration(f.job.id, '测试明确失败释放空间', false);
   assert.ok(await f.store.reserveGeneration(other.id, plan.id, newId(), '重新可用', {}, plan.revision));
 });

@@ -440,7 +440,7 @@ class Handler(BaseHTTPRequestHandler):
             uncertain = self.app.store.list_uncertain_jobs()
             self._json(200, {"users": users, "uncertain_jobs": uncertain,
                              "stats": {"users": len(users), "uncertain_jobs": len(uncertain),
-                                       "remaining_credits": sum(u["credits"] for u in users)}})
+                                       "remaining_credits": sum(u["credits"] for u in users if u["role"] == "student")}})
         elif len(route) == 3 and route[0] == "jobs" and route[2] == "resolve" and self.command == "POST":
             consume = self.body.get("consume")
             if not isinstance(consume, bool):

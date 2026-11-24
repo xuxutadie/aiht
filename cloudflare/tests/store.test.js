@@ -47,6 +47,81 @@ test('管理员只能初始化一个；会话过期和删除后失效', async t 
   assert.equal(await store.getUserBySession('current-session-hash'), null);
 });
 
+test('管理员零余额也可以连续生成超过10张作品，成功和重复回调均不扣点', async t => {
+  const { store } = fixture(t);
+  const admin = await createTestAdmin(store);
+  assert.equal(admin.unlimited_credits, true);
+  assert.deepEqual([admin.credits, admin.reserved_credits, admin.available_credits], [0, 0, 0]);
+  assert.equal((await store.ledger(admin.id))[0].delta, 0);
+  const plan = await confirmedPlan(store, admin);
+  for (let i = 0; i < 12; i += 1) {
+    const key = `admin-free-${i}`;
+    const job = await reserve(store, admin, plan, key);
+    assert.equal(job.unlimited_credits, true);
+    assert.equal((await reserve(store, admin, plan, key)).id, job.id);
+    assert.equal((await store.getUser(admin.id)).reserved_credits, 0);
+    const claimed = await store.claimJob(job.id);
+    assert.equal(claimed.reservation_active, 1);
+    assert.equal(claimed.unlimited_credits, true);
+    const completed = await store.completeGeneration(job.id, artifact());
+    assert.equal((await store.completeGeneration(job.id, artifact())).id, completed.id);
+    assert.equal((await store.getJobInternal(job.id)).reservation_active, 0);
+  }
+  const current = await store.getUser(admin.id);
+  assert.deepEqual([current.credits, current.reserved_credits], [0, 0]);
+  assert.equal((await store.listArtworks(admin.id)).length, 12);
+  const entries = await store.ledger(admin.id);
+  assert.equal(entries.filter(entry => entry.kind === 'reserve' && entry.note === '管理员无限算力，无需预留点数').length, 12);
+  assert.equal(entries.filter(entry => entry.kind === 'consume' && entry.delta === 0).length, 12);
+});
+
+test('管理员失败、冻结、过时恢复及人工核对保留任务状态而不动点数', async t => {
+  const { db, store } = fixture(t);
+  const admin = await createTestAdmin(store);
+  const plan = await confirmedPlan(store, admin);
+  const failed = await reserve(store, admin, plan);
+  await store.failGeneration(failed.id, '明确失败', false);
+  await store.failGeneration(failed.id, '迟到通知', false);
+  const unknown = await reserve(store, admin, plan);
+  await store.claimJob(unknown.id);
+  await store.failGeneration(unknown.id, '上游结果未知', true);
+  const stale = await reserve(store, admin, plan);
+  await db.prepare('UPDATE jobs SET updated_at = ? WHERE id = ?').bind('2020-01-01T00:00:00.000Z', stale.id).run();
+  await store.markStaleJobsUncertain(new Date(Date.now() - 600000).toISOString());
+  assert.equal((await store.getJob(admin.id, failed.id)).status, 'failed');
+  assert.equal((await store.getJobInternal(failed.id)).storage_reservation_bytes, 0);
+  assert.equal((await store.getJobInternal(stale.id)).reservation_active, 1);
+  assert.deepEqual((await store.listUncertainJobs()).map(job => job.unlimited_credits), [true, true]);
+  for (const [job, consume] of [[unknown, true], [stale, false]]) {
+    await store.resolveUncertainJob(job.id, consume, admin.id, '已核对');
+    await assert.rejects(store.resolveUncertainJob(job.id, consume, admin.id, '重复核对'), codeIs('job_already_resolved'));
+    assert.equal((await store.getJob(admin.id, job.id)).status, 'settled');
+    assert.equal((await store.getJobInternal(job.id)).storage_reservation_bytes, 0);
+  }
+  assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM audit').first()).n, 2);
+  assert.deepEqual([(await store.getUser(admin.id)).credits, (await store.getUser(admin.id)).reserved_credits], [0, 0]);
+  assert.ok((await store.ledger(admin.id)).every(entry => entry.delta === 0 && entry.balance_after === 0));
+});
+
+test('旧管理员有限任务仍按旧规则结算，新增无限任务不会占用旧任务的预留', async t => {
+  const { db, store } = fixture(t);
+  const admin = await createTestAdmin(store);
+  const plan = await confirmedPlan(store, admin);
+  const legacy = await reserve(store, admin, plan);
+  // 模拟部署前已经占掉最后一点的真实旧任务；历史流水不带无限标记。
+  await db.prepare('UPDATE users SET credits = 1, reserved_credits = 1 WHERE id = ?').bind(admin.id).run();
+  await db.prepare("UPDATE ledger SET note = '已预留1点算力，生成成功后扣除', balance_after = 1 WHERE job_id = ? AND kind = 'reserve'").bind(legacy.id).run();
+  const fresh = await reserve(store, admin, plan);
+  assert.equal(fresh.unlimited_credits, true);
+  assert.equal((await store.getJob(admin.id, legacy.id)).unlimited_credits, false);
+  await store.claimJob(fresh.id);
+  await store.completeGeneration(fresh.id, artifact());
+  assert.deepEqual([(await store.getUser(admin.id)).credits, (await store.getUser(admin.id)).reserved_credits], [1, 1]);
+  await store.claimJob(legacy.id);
+  await store.completeGeneration(legacy.id, artifact());
+  assert.deepEqual([(await store.getUser(admin.id)).credits, (await store.getUser(admin.id)).reserved_credits], [0, 0]);
+});
+
 test('方案归属隔离；修改内容清除确认并递增revision', async t => {
   const { store } = fixture(t);
   const user = await account(store, '04');

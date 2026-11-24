@@ -6,13 +6,16 @@ import vm from 'node:vm';
 const source = readFileSync(new URL('../../public/workspace.js', import.meta.url), 'utf8')
   .replace(/^import .*;\r?\n/gm, '').replace('export function createWorkspace', 'function createWorkspace');
 const stepsSource = readFileSync(new URL('../../public/steps.js', import.meta.url), 'utf8').replaceAll('export ', '');
+const creditsSource = readFileSync(new URL('../../public/credits.js', import.meta.url), 'utf8')
+  .replace(/^import .*;\r?\n/gm, '').replaceAll('export ', '');
 
 // 只模拟表单所需DOM，执行实际工作台代码与事件，检查保存和生成边界。
 class FormNode {
   constructor(tag, attrs = {}, children = []) {
     this.tag = tag; this.attrs = {}; this.children = []; this.handlers = {}; this.dataset = {};
-    this.disabled = false; this.checked = false; this.isConnected = true; this.classList = { add() {}, remove() {}, toggle() {} };
+    this.disabled = false; this.checked = false; this.required = false; this.isConnected = true; this.classList = { add() {}, remove() {}, toggle() {} };
     for (const [key, value] of Object.entries(attrs)) {
+      if (value === false || value === null || value === undefined) continue;
       if (key.startsWith('on') && typeof value === 'function') this.addEventListener(key.slice(2).toLowerCase(), value);
       else if (key === 'className') this.setAttribute('class', value);
       else { this[key] = value; this.setAttribute(key, value); }
@@ -58,7 +61,7 @@ const ANSWERS = {
   ratio: '16:9', style: '动漫', style_reason: '亲切清楚', innovation_type: '新的故事', innovation: '未来照护生活', innovation_visible: '机器人的照护动作',
 };
 
-function workspace(t, { step = 4, confirmed = false, answers = {}, revokeConfirmation = false, failSave = false, templateError = '' } = {}) {
+function workspace(t, { step = 4, confirmed = false, answers = {}, revokeConfirmation = false, failSave = false, templateError = '', user = { id: 'student-local', credits: 10, role: 'student' }, configured = true, generation = { id: 'job-local', status: 'failed' } } = {}) {
   let stored = { id: 'plan-local', title: '本地计划', answers: { ...ANSWERS, ...answers }, step, confirmed };
   const calls = [];
   const el = (tag, attrs = {}, ...children) => new FormNode(tag, attrs, children);
@@ -74,7 +77,7 @@ function workspace(t, { step = 4, confirmed = false, answers = {}, revokeConfirm
     crypto: { randomUUID: () => 'request-local' }, setTimeout, clearTimeout,
     el, inputField, button: (text, click, className, attrs = {}) => el('button', { ...attrs, className, onClick: click }, text),
     notice: (text, kind) => el('p', { className: `notice ${kind}` }, text), toast() {}, openDialog: () => ({ close() {} }),
-    creditBalance: () => ({ exhausted: false, fullyReserved: false }), EXHAUSTED_MESSAGE: '请联系管理员', artworkEditor() {},
+    artworkEditor() {},
     api: async () => ({ artworks: [] }),
     put: async (path, body) => {
       calls.push({ kind: 'put', path, body: structuredClone(body) });
@@ -88,11 +91,11 @@ function workspace(t, { step = 4, confirmed = false, answers = {}, revokeConfirm
         const custom = Object.hasOwn(stored.answers, 'custom_prompt');
         return { prompt: custom ? stored.answers.custom_prompt.trim() : '根据当前回答整理的模板', template_prompt: templateError ? '' : '根据当前回答整理的模板', template_error: templateError, prompt_mode: custom ? 'custom' : 'template', missing: custom && !stored.answers.custom_prompt.trim() ? ['手动改写提示词'] : [] };
       }
-      return { job: { id: 'job-local', status: 'failed' }, user: { credits: 10 } };
+      return { job: generation, user };
     },
   });
-  vm.runInContext(stepsSource + '\n' + source + '\nthis.makeWorkspace = createWorkspace;', context);
-  const result = context.makeWorkspace(structuredClone(stored), { user: { id: 'student-local', credits: 10, role: 'student' }, configured: true, onUser() {}, onGoAdmin() {}, onOpenGallery() {} });
+  vm.runInContext(stepsSource + '\n' + creditsSource + '\n' + source + '\nthis.makeWorkspace = createWorkspace;', context);
+  const result = context.makeWorkspace(structuredClone(stored), { user, configured, onUser() {}, onGoAdmin() {}, onOpenGallery() {} });
   t.after(result.dispose);
   const findButton = text => result.node.querySelectorAll('button').find(node => node.textContent === text || node.textContent.startsWith(text));
   return { result, root: result.node, calls, findButton };
@@ -175,4 +178,36 @@ test('生成前保存失败时不创建收费请求', async t => {
   const page = workspace(t, { step: 5, confirmed: true, failSave: true });
   await page.findButton('确认生成 1 张').fire('click');
   assert.equal(page.calls.filter(call => call.path === '/api/generate').length, 0);
+});
+
+test('零数字余额的管理员仍能生成，桌面和手机显示无限且结果不扣算力', async t => {
+  const user = { id: 'admin-local', role: 'admin', unlimited_credits: true, credits: 0, reserved_credits: 0, available_credits: 0 };
+  const page = workspace(t, { step: 5, confirmed: true, user, generation: { id: 'job-local', status: 'succeeded', unlimited_credits: true } });
+  assert.match(page.root.querySelector('.generation-balance').textContent, /无限/);
+  assert.match(page.root.querySelector('.mobile-credit-summary').textContent, /无限/);
+  assert.doesNotMatch(page.root.textContent, /请联系管理员进行补充算力/);
+  const generate = page.root.querySelector('[data-generate]');
+  assert.equal(generate.disabled, false);
+  assert.doesNotMatch(generate.textContent, /消耗 1 点/);
+  await generate.fire('click');
+  assert.equal(page.calls.filter(call => call.path === '/api/generate').length, 1);
+  assert.match(page.root.textContent, /本次不消耗算力/);
+  assert.doesNotMatch(page.root.textContent, /本次消耗 1 点算力/);
+});
+
+test('学生算力用尽时仍无法生成，且显示联系管理员提示', async t => {
+  const page = workspace(t, { step: 5, confirmed: true, user: { id: 'student-local', role: 'student', unlimited_credits: false, credits: 0, available_credits: 0 } });
+  const generate = page.root.querySelector('[data-generate]');
+  assert.equal(generate.disabled, true);
+  assert.match(page.root.textContent, /请联系管理员进行补充算力/);
+  await generate.fire('click');
+  assert.equal(page.calls.filter(call => call.path === '/api/generate').length, 0);
+});
+
+test('管理员无限算力也必须配置服务与确认计划', async t => {
+  const user = { id: 'admin-local', role: 'admin', credits: 0 };
+  const noConfig = workspace(t, { step: 5, confirmed: true, user, configured: false });
+  assert.equal(noConfig.root.querySelector('[data-generate]').disabled, true);
+  const unconfirmed = workspace(t, { step: 5, confirmed: false, user });
+  assert.equal(unconfirmed.root.querySelector('[data-generate]').disabled, true);
 });

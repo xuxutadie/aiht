@@ -125,6 +125,7 @@ def user_record(row) -> dict:
     keys = ("id", "name", "phone", "region", "school", "grade", "role", "credits", "reserved_credits", "created_at")
     result = {key: row[key] for key in keys}
     result["available_credits"] = result["credits"] - result["reserved_credits"]
+    result["unlimited_credits"] = result["role"] == "admin"
     return result
 
 

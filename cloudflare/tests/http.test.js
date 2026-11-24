@@ -97,6 +97,29 @@ async function prepareGeneration(env) {
 const testImage = { data: new Uint8Array([137, 80, 78, 71]), mime: 'image/png', width: 32, height: 32, usage: { generated_images: 1 }, upstream_request_id: 'test-request-only' };
 function message(jobId) { return { body: { job_id: jobId }, ack() { this.acked = true; }, retry() { throw new Error('付费生成任务不得自动重试'); } }; }
 
+test('管理员 API 公开无限算力并成功绘图不扣点，汇总只计算学生余额', async t => {
+  const env = environment(t);
+  const f = await prepareGeneration(env);
+  const admin = (await call(env, '/api/me', { cookie: f.adminCookie })).data.user;
+  assert.equal(admin.unlimited_credits, true);
+  assert.equal(f.user.unlimited_credits, false);
+  // 历史管理员可能保留数字余额，但不能并入学生算力统计。
+  await env.DB.prepare('UPDATE users SET credits = 7 WHERE id = ?').bind(admin.id).run();
+  const overview = await call(env, '/api/admin/overview', { cookie: f.adminCookie });
+  assert.equal(overview.data.stats.remaining_credits, 10);
+  const plan = (await call(env, '/api/plans', { method: 'POST', cookie: f.adminCookie, body: { title: ANSWERS.theme, answers: ANSWERS } })).data.plan;
+  await call(env, `/api/plans/${plan.id}`, { method: 'PUT', cookie: f.adminCookie, body: { title: ANSWERS.theme, answers: ANSWERS, step: 5, confirmed: true } });
+  const generated = await call(env, '/api/generate', { method: 'POST', cookie: f.adminCookie, body: { plan_id: plan.id, request_key: crypto.randomUUID() } });
+  assert.equal(generated.status, 202);
+  assert.equal(generated.data.job.unlimited_credits, true);
+  assert.equal(generated.data.user.reserved_credits, 0);
+  await handleQueue({ messages: [message(generated.data.job.id)] }, env, async () => testImage);
+  const refreshed = await call(env, `/api/jobs/${generated.data.job.id}`, { cookie: f.adminCookie });
+  assert.equal(refreshed.data.job.status, 'succeeded');
+  assert.equal(refreshed.data.user.credits, 7);
+  assert.equal(refreshed.data.user.unlimited_credits, true);
+});
+
 test('切换服务商必须重新填写密钥，拒绝时保留原有加密配置', async t => {
   const env = environment(t);
   const { adminCookie } = await prepareGeneration(env);

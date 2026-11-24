@@ -1,4 +1,4 @@
-import { DomainError, INITIAL_CREDITS, IMAGE_STORAGE_BUDGET, IMAGE_RESERVATION_BYTES, now, newId, textValue } from './contracts.js';
+import { DomainError, INITIAL_CREDITS, ADMIN_UNLIMITED_RESERVE_NOTE, IMAGE_STORAGE_BUDGET, IMAGE_RESERVATION_BYTES, now, newId, textValue } from './contracts.js';
 import { sha256 } from './crypto.js';
 import { validateAuthorizationCode, validateAuthorizationCodeCount, validateAuthorizationCodePage,
   randomAuthorizationCode, authorizationCodeGenerationError, authorizationCodeRecord } from './authorization-codes.js';
@@ -6,6 +6,10 @@ import { validateAuthorizationCode, validateAuthorizationCodeCount, validateAuth
 const USER_FIELDS = ['id', 'name', 'phone', 'region', 'school', 'grade', 'role', 'credits', 'reserved_credits', 'created_at'];
 const JOB_FIELDS = ['id', 'user_id', 'plan_id', 'status', 'error_message', 'artwork_id', 'created_at', 'updated_at', 'upstream_request_id'];
 const USAGE_FIELDS = ['generated_images', 'input_images', 'output_tokens', 'total_tokens'];
+// 固定免扣标记跟随任务写入流水；旧任务没有此标记，仍按已预留的点数结算。
+const UNLIMITED_JOB_SQL = `EXISTS (SELECT 1 FROM ledger AS reserve_entry WHERE reserve_entry.job_id = jobs.id
+  AND reserve_entry.user_id = jobs.user_id AND reserve_entry.kind = 'reserve' AND reserve_entry.note = '${ADMIN_UNLIMITED_RESERVE_NOTE}')`;
+const JOB_SELECT = `SELECT jobs.*, ${UNLIMITED_JOB_SQL} AS unlimited_credits FROM jobs`;
 
 function found(row, message) {
   if (!row) throw new DomainError(404, 'not_found', message);
@@ -15,6 +19,7 @@ function userRecord(row) {
   found(row, '账号不存在。');
   const user = Object.fromEntries(USER_FIELDS.map(key => [key, row[key]]));
   user.available_credits = user.credits - user.reserved_credits;
+  user.unlimited_credits = user.role === 'admin';
   return user;
 }
 function planRecord(row) {
@@ -23,7 +28,7 @@ function planRecord(row) {
 }
 function jobRecord(row) {
   found(row, '生成任务不存在。');
-  return Object.fromEntries(JOB_FIELDS.map(key => [key, row[key]]));
+  return { ...Object.fromEntries(JOB_FIELDS.map(key => [key, row[key]])), unlimited_credits: Boolean(row.unlimited_credits) };
 }
 function reservationResult(job, newlyCreated) {
   // 仅本次HTTP调用使用；恢复请求不会重复投递，JSON仍保留原有公开字段。
@@ -77,18 +82,19 @@ export class Store {
     const value = validateUser(profile, passwordHash, role);
     const codeHash = role === 'student' ? await sha256(validateAuthorizationCode(authorizationCode)) : null;
     const id = newId(), timestamp = now();
+    const initialCredits = role === 'admin' ? 0 : INITIAL_CREDITS;
     try {
       // D1 batch是一个事务：条件建号、赠送流水、用码记录一起提交；并发请求不能各自先查后写。
       const create = role === 'student'
         ? this.statement(`INSERT INTO users (id,name,phone,region,school,grade,role,password_hash,credits,reserved_credits,created_at)
           SELECT ?,?,?,?,?,?,?,?,?,0,? FROM authorization_codes WHERE code_hash = ? AND used_by IS NULL`,
-        id, value.name, value.phone, value.region, value.school, value.grade, role, passwordHash, INITIAL_CREDITS, timestamp, codeHash)
+        id, value.name, value.phone, value.region, value.school, value.grade, role, passwordHash, initialCredits, timestamp, codeHash)
         : this.statement(`INSERT INTO users (id,name,phone,region,school,grade,role,password_hash,credits,reserved_credits,created_at)
-          VALUES (?,?,?,?,?,?,?,?,?,0,?)`, id, value.name, value.phone, value.region, value.school, value.grade, role, passwordHash, INITIAL_CREDITS, timestamp);
+          VALUES (?,?,?,?,?,?,?,?,?,0,?)`, id, value.name, value.phone, value.region, value.school, value.grade, role, passwordHash, initialCredits, timestamp);
       const statements = [create,
         this.statement(`INSERT INTO ledger (id,user_id,kind,delta,balance_after,job_id,note,created_at)
           SELECT ?,id,'grant',?,?,NULL,?,? FROM users WHERE id = ?`,
-        newId(), INITIAL_CREDITS, INITIAL_CREDITS, '首次注册赠送10点算力', timestamp, id)];
+        newId(), initialCredits, initialCredits, role === 'admin' ? '管理员享有无限算力' : '首次注册赠送10点算力', timestamp, id)];
       if (role === 'student') statements.push(this.statement(`UPDATE authorization_codes SET used_by = ?, used_at = ?
         WHERE code_hash = ? AND used_by IS NULL AND EXISTS (SELECT 1 FROM users WHERE id = ?)`, id, timestamp, codeHash, id));
       const result = await this.db.batch(statements);
@@ -183,7 +189,7 @@ export class Store {
 
   async getJobByRequest(userId, requestKey) {
     if (typeof requestKey !== 'string' || !requestKey || requestKey.length > 128) return null;
-    const row = await this.first('SELECT * FROM jobs WHERE user_id = ? AND request_key = ?', userId, requestKey);
+    const row = await this.first(`${JOB_SELECT} WHERE user_id = ? AND request_key = ?`, userId, requestKey);
     return row ? jobRecord(row) : null;
   }
   async reserveGeneration(userId, planId, requestKey, prompt, options, expectedRevision) {
@@ -206,15 +212,16 @@ export class Store {
         SELECT ?,users.id,plans.id,?,?,?,plans.answers,plans.title,'queued',1,?,NULL,NULL,?,?
         FROM plans JOIN users ON users.id = plans.user_id
         WHERE plans.id = ? AND plans.user_id = ? AND plans.confirmed = 1 AND plans.revision = ?
-          AND users.credits - users.reserved_credits >= 1
+          AND (users.role = 'admin' OR users.credits - users.reserved_credits >= 1)
           AND (SELECT COALESCE(SUM(encoded_size),0) FROM image_objects)
             + (SELECT COALESCE(SUM(storage_reservation_bytes),0) FROM jobs) <= ? - ?`,
       id, requestKey, prompt, encodedOptions, IMAGE_RESERVATION_BYTES, timestamp, timestamp, planId, userId, revision, IMAGE_STORAGE_BUDGET, IMAGE_RESERVATION_BYTES),
-      this.statement(`UPDATE users SET reserved_credits = reserved_credits + 1 WHERE id = ?
+      this.statement(`UPDATE users SET reserved_credits = reserved_credits + 1 WHERE id = ? AND role <> 'admin'
         AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND reservation_active = 1 AND status = 'queued')`, userId, id),
       this.statement(`INSERT INTO ledger (id,user_id,kind,delta,balance_after,job_id,note,created_at)
-        SELECT ?,users.id,'reserve',0,users.credits,jobs.id,?,? FROM users JOIN jobs ON jobs.user_id = users.id
-        WHERE jobs.id = ?`, newId(), '已预留1点算力，生成成功后扣除', timestamp, id),
+        SELECT ?,users.id,'reserve',0,users.credits,jobs.id,CASE WHEN users.role = 'admin' THEN ? ELSE ? END,?
+        FROM users JOIN jobs ON jobs.user_id = users.id
+        WHERE jobs.id = ?`, newId(), ADMIN_UNLIMITED_RESERVE_NOTE, '已预留1点算力，生成成功后扣除', timestamp, id),
     ]);
     const job = await this.getJobByRequest(userId, requestKey);
     if (job) {
@@ -225,15 +232,15 @@ export class Store {
     if (latest.revision !== revision) throw new DomainError(409, 'plan_changed', '创作方案刚刚被修改，请重新查看并确认后再生成。');
     if (!latest.confirmed) throw new DomainError(409, 'plan_unconfirmed', '请先完成自查并确认创作方案。');
     const user = await this.getUser(userId);
-    if (user.available_credits >= 1) throw new DomainError(409, 'storage_capacity', '云端图片存储空间不足，请联系管理员整理后再生成。本次未消耗算力。');
+    if (user.unlimited_credits || user.available_credits >= 1) throw new DomainError(409, 'storage_capacity', '云端图片存储空间不足，请联系管理员整理后再生成。本次未消耗算力。');
     throw new DomainError(409, 'insufficient_credits', user.credits === 0
       ? '算力已用完，请联系管理员进行补充算力。' : '当前算力已全部预留，请等待生成结果或联系老师核对。');
   }
-  async getJob(userId, id) { return jobRecord(await this.first('SELECT * FROM jobs WHERE id = ? AND user_id = ?', id, userId)); }
-  async getJobInternal(id) { return internalJob(await this.first('SELECT * FROM jobs WHERE id = ?', id)); }
+  async getJob(userId, id) { return jobRecord(await this.first(`${JOB_SELECT} WHERE id = ? AND user_id = ?`, id, userId)); }
+  async getJobInternal(id) { return internalJob(await this.first(`${JOB_SELECT} WHERE id = ?`, id)); }
   async claimJob(id) {
     const row = await this.statement(`UPDATE jobs SET status = 'running', updated_at = ?
-      WHERE id = ? AND status = 'queued' AND reservation_active = 1 RETURNING *`, now(), id).first();
+      WHERE id = ? AND status = 'queued' AND reservation_active = 1 RETURNING *, ${UNLIMITED_JOB_SQL} AS unlimited_credits`, now(), id).first();
     return row ? internalJob(row) : null;
   }
   async recordProviderResult(id, requestId, usage = {}) {
@@ -257,15 +264,19 @@ export class Store {
     const description = textValue(artifact.description ?? '', '作品说明', 5000);
     const reflection = textValue(artifact.reflection ?? '', '作品反思', 5000);
     const timestamp = now();
+    const points = previous.unlimited_credits ? 0 : 1;
     await this.db.batch([
       this.statement(`INSERT INTO artworks (id,user_id,job_id,plan_id,title,image_path,mime,width,height,prompt,answers,description,reflection,created_at)
         SELECT ?,user_id,id,plan_id,snapshot_title,?,?,?,?,prompt,snapshot_answers,?,?,? FROM jobs
         WHERE id = ? AND status = 'running' AND reservation_active = 1`, artworkId, imagePath, artifact.mime, artifact.width, artifact.height, description, reflection, timestamp, id),
-      this.statement(`UPDATE users SET credits = credits - 1, reserved_credits = reserved_credits - 1
-        WHERE id = (SELECT user_id FROM jobs WHERE id = ?) AND EXISTS (SELECT 1 FROM artworks WHERE id = ? AND job_id = ?)`, id, artworkId, id),
+      ...(points ? [this.statement(`UPDATE users SET credits = credits - 1, reserved_credits = reserved_credits - 1
+        WHERE id = (SELECT user_id FROM jobs WHERE id = ? AND status = 'running' AND reservation_active = 1)
+          AND EXISTS (SELECT 1 FROM artworks WHERE id = ? AND job_id = ?)`, id, artworkId, id)] : []),
       this.statement(`INSERT INTO ledger (id,user_id,kind,delta,balance_after,job_id,note,created_at)
-        SELECT ?,users.id,'consume',-1,users.credits,jobs.id,?,? FROM users JOIN jobs ON jobs.user_id = users.id
-        WHERE jobs.id = ? AND EXISTS (SELECT 1 FROM artworks WHERE id = ? AND job_id = jobs.id)`, newId(), '单张作品生成成功，扣除1点算力', timestamp, id, artworkId),
+        SELECT ?,users.id,'consume',?,users.credits,jobs.id,?,? FROM users JOIN jobs ON jobs.user_id = users.id
+        WHERE jobs.id = ? AND jobs.status = 'running' AND jobs.reservation_active = 1
+          AND EXISTS (SELECT 1 FROM artworks WHERE id = ? AND job_id = jobs.id)`, newId(), -points,
+      previous.unlimited_credits ? '单张作品生成成功，管理员无限算力，不扣点数' : '单张作品生成成功，扣除1点算力', timestamp, id, artworkId),
       this.statement(`UPDATE jobs SET status = 'succeeded', reservation_active = 0, storage_reservation_bytes = 0, artwork_id = ?, error_message = NULL, updated_at = ?
         WHERE id = ? AND status = 'running' AND EXISTS (SELECT 1 FROM artworks WHERE id = ? AND job_id = ?)`, artworkId, timestamp, id, artworkId, id),
     ]);
@@ -275,13 +286,13 @@ export class Store {
   async failGeneration(id, message, uncertain = false, onlyQueued = false) {
     if (typeof uncertain !== 'boolean' || typeof onlyQueued !== 'boolean') throw new DomainError(400, 'invalid_input', '任务状态格式不正确。');
     message = textValue(message, '任务说明', 1000) || '生成未完成，请联系老师。';
-    await this.getJobInternal(id);
+    const job = await this.getJobInternal(id);
     const timestamp = now();
     // 投递请求报错时可能消费者已开始工作，只允许原子冻结尚未领取的queued任务。
     // 这里的SQL片段来自固定布尔分支，不接受请求中的SQL或状态文字。
     const eligible = onlyQueued ? "'queued'" : "'queued','running'";
     const statements = [];
-    if (!uncertain) statements.push(this.statement(`UPDATE users SET reserved_credits = reserved_credits - 1
+    if (!uncertain && !job.unlimited_credits) statements.push(this.statement(`UPDATE users SET reserved_credits = reserved_credits - 1
       WHERE id = (SELECT user_id FROM jobs WHERE id = ? AND status IN (${eligible}) AND reservation_active = 1)`, id));
     if (!uncertain) statements.push(this.statement(`DELETE FROM image_objects WHERE job_id = ? AND completed = 0
       AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status IN (${eligible}) AND reservation_active = 1)`, id, id));
@@ -289,25 +300,28 @@ export class Store {
       this.statement(`INSERT INTO ledger (id,user_id,kind,delta,balance_after,job_id,note,created_at)
         SELECT ?,users.id,?,0,users.credits,jobs.id,?,? FROM users JOIN jobs ON jobs.user_id = users.id
         WHERE jobs.id = ? AND jobs.status IN (${eligible}) AND jobs.reservation_active = 1`, newId(), uncertain ? 'freeze' : 'release',
-      uncertain ? '结果待核对，保留预留的1点算力' : '生成明确失败，不扣算力，已释放预留的1点算力', timestamp, id),
+      job.unlimited_credits ? (uncertain ? '结果待核对，管理员无限算力，无需预留点数' : '生成明确失败，管理员无限算力，不扣点数')
+        : (uncertain ? '结果待核对，保留预留的1点算力' : '生成明确失败，不扣算力，已释放预留的1点算力'), timestamp, id),
       this.statement(`UPDATE jobs SET status = ?, reservation_active = ?, storage_reservation_bytes = ${uncertain ? 'storage_reservation_bytes' : '0'}, error_message = ?, updated_at = ?
         WHERE id = ? AND status IN (${eligible}) AND reservation_active = 1`, uncertain ? 'uncertain' : 'failed', Number(uncertain), message, timestamp, id),
     );
     await this.db.batch(statements);
   }
-  async listUncertainJobs() { return (await this.all("SELECT * FROM jobs WHERE status = 'uncertain' ORDER BY created_at, rowid")).map(jobRecord); }
+  async listUncertainJobs() { return (await this.all(`${JOB_SELECT} WHERE status = 'uncertain' ORDER BY created_at, rowid`)).map(jobRecord); }
   async resolveUncertainJob(id, consume, adminId, reason) {
     if (typeof consume !== 'boolean') throw new DomainError(400, 'invalid_input', '请选择扣除或返还算力。');
     reason = textValue(reason, '核对原因', 1000, false);
     if ((await this.getUser(adminId)).role !== 'admin') throw new DomainError(403, 'admin_required', '仅管理员可以核对生成结果。');
-    await this.getJobInternal(id);
+    const job = await this.getJobInternal(id);
     const auditId = newId(), timestamp = now();
+    const points = job.unlimited_credits ? 0 : 1;
     await this.db.batch([
-      this.statement(`UPDATE users SET credits = credits - ?, reserved_credits = reserved_credits - 1
-        WHERE id = (SELECT user_id FROM jobs WHERE id = ? AND status = 'uncertain' AND reservation_active = 1)`, Number(consume), id),
+      ...(points ? [this.statement(`UPDATE users SET credits = credits - ?, reserved_credits = reserved_credits - 1
+        WHERE id = (SELECT user_id FROM jobs WHERE id = ? AND status = 'uncertain' AND reservation_active = 1)`, Number(consume), id)] : []),
       this.statement(`INSERT INTO ledger (id,user_id,kind,delta,balance_after,job_id,note,created_at)
         SELECT ?,users.id,?,?,users.credits,jobs.id,?,? FROM users JOIN jobs ON jobs.user_id = users.id
-        WHERE jobs.id = ? AND jobs.status = 'uncertain' AND jobs.reservation_active = 1`, newId(), consume ? 'manual_consume' : 'manual_release', consume ? -1 : 0, `老师核对：${reason}`, timestamp, id),
+        WHERE jobs.id = ? AND jobs.status = 'uncertain' AND jobs.reservation_active = 1`, newId(), consume ? 'manual_consume' : 'manual_release', -points * Number(consume),
+      job.unlimited_credits ? `老师核对（管理员无限算力，不扣点数）：${reason}` : `老师核对：${reason}`, timestamp, id),
       this.statement(`INSERT INTO audit (id,job_id,admin_user_id,consume,reason,created_at)
         SELECT ?,id,?,?,?,? FROM jobs WHERE id = ? AND status = 'uncertain' AND reservation_active = 1`, auditId, adminId, Number(consume), reason, timestamp, id),
       this.statement(`DELETE FROM image_objects WHERE job_id = ? AND completed = 0
@@ -322,9 +336,9 @@ export class Store {
     const timestamp = now();
     await this.db.batch([
       this.statement(`INSERT INTO ledger (id,user_id,kind,delta,balance_after,job_id,note,created_at)
-        SELECT lower(hex(randomblob(16))),users.id,'freeze',0,users.credits,jobs.id,?,?
+        SELECT lower(hex(randomblob(16))),users.id,'freeze',0,users.credits,jobs.id,CASE WHEN ${UNLIMITED_JOB_SQL} THEN ? ELSE ? END,?
         FROM users JOIN jobs ON jobs.user_id = users.id
-        WHERE jobs.status IN ('queued','running') AND jobs.reservation_active = 1 AND jobs.updated_at < ?`, '任务等待时间过长，保留预留的1点算力等待老师核对', timestamp, cutoffISOString),
+        WHERE jobs.status IN ('queued','running') AND jobs.reservation_active = 1 AND jobs.updated_at < ?`, '管理员任务等待时间过长，结果待核对，无需预留点数', '任务等待时间过长，保留预留的1点算力等待老师核对', timestamp, cutoffISOString),
       this.statement(`UPDATE jobs SET status = 'uncertain', error_message = ?, updated_at = ?
         WHERE status IN ('queued','running') AND reservation_active = 1 AND updated_at < ?`, '任务等待时间过长，结果待老师核对，请勿重复生成。', timestamp, cutoffISOString),
     ]);

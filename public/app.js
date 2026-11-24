@@ -5,7 +5,7 @@ import { createWorkspace } from './workspace.js';
 import { renderArtworks } from './artworks.js';
 import { renderAdmin } from './admin.js';
 import { DEFAULT_ANSWERS, STEPS } from './steps.js';
-import { createCreditReminder } from './credits.js';
+import { creditBalance, createCreditReminder } from './credits.js';
 
 const root = document.querySelector('#app');
 const state = { user: null, configured: false, testMode: false, view: 'workspace', workspace: null, plan: null, routeBusy: false };
@@ -33,7 +33,7 @@ function mount(...nodes) {
 function onUser(user) {
   if (!user) return;
   state.user = user;
-  if (creditText) creditText.textContent = `剩余算力 ${user.available_credits ?? user.credits} 点`;
+  if (creditText) creditText.textContent = `剩余算力 ${creditBalance(user).availableText}`;
   creditReminder.update(user);
 }
 function renderNav() {
@@ -44,14 +44,15 @@ function shell() {
   nav = el('nav', { className: 'main-nav', 'aria-label': '主导航' });
   content = el('main', { id: 'main', className: 'main-content', tabindex: '-1' });
   breadcrumb = el('span', { className: 'breadcrumb' }, '创作 / 练习任务');
-  creditText = el('span', { className: 'credit-badge' }, `剩余算力 ${state.user.available_credits ?? state.user.credits} 点`);
+  const balance = creditBalance(state.user);
+  creditText = el('span', { className: 'credit-badge' }, `剩余算力 ${balance.availableText}`);
   const profile = el('div', { className: 'sidebar-profile' }, el('div', { className: 'profile-avatar' }, state.user.name?.slice(0, 1) || '我'), el('div', {}, el('strong', {}, state.user.name), el('small', {}, state.user.role === 'admin' ? '管理员' : '学生')), button('退出', logout, 'text-button', { 'aria-label': '退出登录' }));
-  const sidebar = el('aside', { className: 'sidebar' }, el('a', { href: '/', className: 'brand' }, el('span', { className: 'brand-mark' }, '创'), el('span', {}, '作品创作台')), nav, el('div', { className: 'sidebar-bottom' }, el('div', { className: 'quota-card' }, el('span', {}, '我的算力点数'), creditText, el('small', {}, '成功生成 1 张消耗 1 点')), profile));
+  const sidebar = el('aside', { className: 'sidebar' }, el('a', { href: '/', className: 'brand' }, el('span', { className: 'brand-mark' }, '创'), el('span', {}, '作品创作台')), nav, el('div', { className: 'sidebar-bottom' }, el('div', { className: 'quota-card' }, el('span', {}, '我的算力点数'), creditText, el('small', {}, balance.unlimited ? '管理员生成不扣算力' : '成功生成 1 张消耗 1 点')), profile));
   const mobileMenu = () => {
     const dialogContent = el('div', { className: 'mobile-nav' });
     const dialog = openDialog('我的创作空间', dialogContent);
     Object.entries(VIEWS).filter(([key]) => key !== 'admin' || state.user.role === 'admin').forEach(([key, [mark, title]]) => dialogContent.append(button(el('span', { className: 'nav-content' }, el('span', { className: `nav-mark nav-${key}` }, mark), title), () => { dialog.close(); navigate(key); }, `nav-button ${state.view === key ? 'active' : ''}`)));
-    dialogContent.append(el('p', { className: 'muted' }, `${state.user.name} · 剩余算力 ${state.user.available_credits ?? state.user.credits} 点`), button('退出登录', () => { dialog.close(); logout(); }, 'button secondary'));
+    dialogContent.append(el('p', { className: 'muted' }, `${state.user.name} · 剩余算力 ${creditBalance(state.user).availableText}`), button('退出登录', () => { dialog.close(); logout(); }, 'button secondary'));
   };
   const header = el('header', { className: 'topbar' }, el('div', { className: 'mobile-brand' }, button('☰', mobileMenu, 'menu-button', { 'aria-label': '打开菜单' }), el('span', { className: 'brand-mark' }, '创'), el('span', { className: 'mobile-brand-title' }, '作品创作台')), breadcrumb, button('保存草稿', () => state.workspace?.save(), 'button secondary header-save', { 'data-header-save': true }));
   mount(el('div', { className: 'app-shell' }, sidebar, el('div', { className: 'app-body' }, header, content)));
@@ -116,8 +117,17 @@ async function renderDrafts(host) {
 }
 async function renderCredits(host) {
   const { user, entries } = await api('/api/credits'); onUser(user);
-  const labels = { welcome: '首次赠送', grant: '首次赠送', initial_grant: '首次赠送', register: '首次赠送', reserve: '生成预留', release: '预留释放', generation: '成功生成', consume: '成功生成', admin_consume: '人工核对消耗算力', admin_release: '人工核对释放' };
-  host.replaceChildren(el('div', { className: 'credit-summary' }, el('div', { className: 'stat-card mint' }, el('span', {}, '剩余算力'), el('strong', {}, `${user.available_credits ?? user.credits} 点`)), el('div', { className: 'stat-card yellow' }, el('span', {}, '预留算力'), el('strong', {}, `${user.reserved_credits || 0} 点`)), el('div', { className: 'card credit-explainer' }, el('strong', {}, '成功生成 1 张，消耗 1 点算力'), el('p', {}, '保存草稿、查看和下载作品不消耗算力。结果不确定的任务会暂时预留 1 点算力，等待老师核对。'))), entries.length ? el('div', { className: 'card ledger-list' }, entries.map(entry => el('article', { className: 'ledger-entry' }, el('div', {}, el('strong', {}, labels[entry.kind] || '算力变动'), el('p', {}, entry.note || '算力记录'), el('small', {}, formatTime(entry.created_at))), el('div', { className: 'ledger-value' }, el('strong', {}, Number(entry.delta) > 0 ? `+${entry.delta} 点` : `${entry.delta} 点`), el('small', {}, `结余 ${entry.balance_after} 点`))))) : emptyState('还没有算力记录', '开始创作后，相关算力记录会显示在这里。'));
+  const balance = creditBalance(user);
+  const labels = { welcome: '首次赠送', grant: '首次赠送', initial_grant: '首次赠送', register: '首次赠送', reserve: '生成预留', release: '预留释放', freeze: '待核对', generation: '成功生成', consume: '成功生成', manual_consume: '人工核对消耗算力', manual_release: '人工核对释放', admin_consume: '人工核对消耗算力', admin_release: '人工核对释放' };
+  const unlimitedJobs = new Set(entries.filter(entry => entry.kind === 'reserve' && entry.note === '管理员无限算力，无需预留点数').map(entry => entry.job_id));
+  const freeLabels = { grant: '管理员权限', reserve: '生成请求', release: '生成失败', freeze: '待核对', manual_consume: '人工核对已出图', manual_release: '人工核对未出图' };
+  const ledgerEntries = entries.map(entry => {
+    const freeEntry = balance.unlimited && (unlimitedJobs.has(entry.job_id) || (entry.kind === 'grant' && Number(entry.delta) === 0));
+    const label = (freeEntry ? freeLabels[entry.kind] : null) || labels[entry.kind] || '算力变动';
+    const ledgerBalance = freeEntry ? '平台算力无限' : `${balance.unlimited ? '历史结余' : '结余'} ${entry.balance_after} 点`;
+    return el('article', { className: 'ledger-entry' }, el('div', {}, el('strong', {}, label), el('p', {}, entry.note || '算力记录'), el('small', {}, formatTime(entry.created_at))), el('div', { className: 'ledger-value' }, el('strong', {}, Number(entry.delta) > 0 ? `+${entry.delta} 点` : `${entry.delta} 点`), el('small', {}, ledgerBalance)));
+  });
+  host.replaceChildren(el('div', { className: 'credit-summary' }, el('div', { className: 'stat-card mint' }, el('span', {}, '剩余算力'), el('strong', {}, balance.availableText)), el('div', { className: 'stat-card yellow' }, el('span', {}, '预留算力'), el('strong', {}, balance.reservedText)), el('div', { className: 'card credit-explainer' }, el('strong', {}, balance.unlimited ? '管理员拥有无限平台算力，生成不扣点' : '成功生成 1 张，消耗 1 点算力'), el('p', {}, balance.unlimited ? '新生成任务无需预留算力，结果不确定仍需核对。绘图服务商按实际调用计费；以前的算力记录继续保留。' : '保存草稿、查看和下载作品不消耗算力。结果不确定的任务会暂时预留 1 点算力，等待老师核对。'))), entries.length ? el('div', { className: 'card ledger-list' }, ledgerEntries) : emptyState('还没有算力记录', '开始创作后，相关算力记录会显示在这里。'));
 }
 async function logout() {
   try { if (state.workspace) await state.workspace.saveBeforeLeave(); await post('/api/logout'); state.workspace?.dispose(); state.workspace = null; state.user = null; creditReminder.reset(); mount(authScreen(false, user => signedIn(user).catch(err => toast(err.message, true)))); }

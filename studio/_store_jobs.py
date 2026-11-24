@@ -4,12 +4,22 @@ import hashlib
 import json
 import re
 
-from .contracts import DomainError
+from .contracts import DomainError, ADMIN_UNLIMITED_RESERVE_NOTE
 from ._store_database import (artwork_record, job_record, json_object, new_id, now,
                               plan_record, text_value)
 
 
 class GenerationStore:
+    def _job_unlimited(self, connection, job):
+        # 按任务创建时的结算规则处理，兼容历史管理员已预留的算力。
+        return connection.execute("SELECT 1 FROM ledger WHERE user_id=? AND job_id=? AND kind='reserve' AND note=? LIMIT 1",
+                                  (job["user_id"], job["id"], ADMIN_UNLIMITED_RESERVE_NOTE)).fetchone() is not None
+
+    def _public_job_in(self, connection, row):
+        result = job_record(row)
+        result["unlimited_credits"] = self._job_unlimited(connection, result)
+        return result
+
     def reserve_generation(self, user_id, plan_id, request_key, prompt, options, expected_plan_hash=None):
         request_key = text_value(request_key, "请求标识", 128, False)
         prompt = text_value(prompt, "绘图提示词", 20000, False)
@@ -34,11 +44,12 @@ class GenerationStore:
             if existing is not None:
                 if existing["request_hash"] != fingerprint:
                     raise DomainError(409, "request_conflict", "该请求标识已用于其他内容，请重新发起创作。")
-                return job_record(existing)
+                return self._public_job_in(connection, existing)
             if not plan["confirmed"]:
                 raise DomainError(409, "plan_unconfirmed", "请先完成自查并确认创作方案。")
             user = self._user_in(connection, user_id)
-            if user["available_credits"] < 1:
+            unlimited = user["unlimited_credits"]
+            if not unlimited and user["available_credits"] < 1:
                 message = ("算力已用完，请联系管理员进行补充算力。" if user["credits"] == 0
                            else "当前算力已全部预留，请等待生成结果或联系老师核对。")
                 raise DomainError(409, "insufficient_credits", message)
@@ -49,9 +60,11 @@ class GenerationStore:
                 VALUES (?,?,?,?,?,?,?,?,?,'queued',NULL,NULL,?,?)""",
                 (job_id, user_id, plan_id, request_key, fingerprint, prompt, encoded_options,
                  row["answers"], plan["title"], timestamp, timestamp))
-            connection.execute("UPDATE users SET reserved_credits = reserved_credits + 1 WHERE id = ?", (user_id,))
-            self._ledger_in(connection, user_id, "reserve", 0, job_id, "已预留1点算力，生成成功后扣除")
-            return job_record(connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
+            if not unlimited:
+                connection.execute("UPDATE users SET reserved_credits = reserved_credits + 1 WHERE id = ?", (user_id,))
+            self._ledger_in(connection, user_id, "reserve", 0, job_id,
+                            ADMIN_UNLIMITED_RESERVE_NOTE if unlimited else "已预留1点算力，生成成功后扣除")
+            return self._public_job_in(connection, connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
 
     def mark_job_running(self, job_id):
         with self.transaction() as connection:
@@ -63,8 +76,8 @@ class GenerationStore:
 
     def get_job(self, user_id, job_id):
         with self.connection() as connection:
-            return job_record(connection.execute("SELECT * FROM jobs WHERE id = ? AND user_id = ?",
-                                                 (job_id, user_id)).fetchone())
+            return self._public_job_in(connection, connection.execute("SELECT * FROM jobs WHERE id = ? AND user_id = ?",
+                                                                      (job_id, user_id)).fetchone())
 
     def get_job_by_request(self, user_id, request_key):
         """仅按本人请求号找回公开任务状态，不受后来修改草稿或配置的影响。"""
@@ -73,13 +86,13 @@ class GenerationStore:
         with self.connection() as connection:
             row = connection.execute("SELECT * FROM jobs WHERE user_id = ? AND request_key = ?",
                                      (user_id, request_key)).fetchone()
-            return job_record(row) if row is not None else None
+            return self._public_job_in(connection, row) if row is not None else None
 
     def get_job_internal(self, job_id):
         """仅供后台执行者加载已预占的快照，HTTP 路由不得直接返回。"""
         with self.connection() as connection:
             row = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-            result = job_record(row)
+            result = self._public_job_in(connection, row)
             result.update(prompt=row["prompt"], options=json.loads(row["options"]),
                           answers=json.loads(row["snapshot_answers"]), title=row["snapshot_title"],
                           usage=json.loads(row["usage_json"]))
@@ -129,11 +142,14 @@ class GenerationStore:
             connection.execute("INSERT INTO artworks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (artwork_id, job["user_id"], job_id, job["plan_id"], job["snapshot_title"], image_path,
                  mime, width, height, job["prompt"], job["snapshot_answers"], description, reflection, timestamp))
-            connection.execute("UPDATE users SET credits = credits - 1, reserved_credits = reserved_credits - 1 WHERE id = ?",
-                               (job["user_id"],))
+            unlimited = self._job_unlimited(connection, job)
+            if not unlimited:
+                connection.execute("UPDATE users SET credits = credits - 1, reserved_credits = reserved_credits - 1 WHERE id = ?",
+                                   (job["user_id"],))
             connection.execute("UPDATE jobs SET status = 'succeeded', artwork_id = ?, error_message = NULL, updated_at = ? WHERE id = ?",
                                (artwork_id, timestamp, job_id))
-            self._ledger_in(connection, job["user_id"], "consume", -1, job_id, "单张作品生成成功，扣除1点算力")
+            self._ledger_in(connection, job["user_id"], "consume", 0 if unlimited else -1, job_id,
+                            "单张作品生成成功，管理员无限算力，不扣点数" if unlimited else "单张作品生成成功，扣除1点算力")
             return artwork_record(connection.execute("SELECT * FROM artworks WHERE id = ?", (artwork_id,)).fetchone())
 
     def fail_generation(self, job_id, message, uncertain=False):
@@ -149,14 +165,18 @@ class GenerationStore:
             status = "uncertain" if uncertain else "failed"
             connection.execute("UPDATE jobs SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
                                (status, message, now(), job_id))
-            if not uncertain:
+            unlimited = self._job_unlimited(connection, job)
+            if not uncertain and not unlimited:
                 connection.execute("UPDATE users SET reserved_credits = reserved_credits - 1 WHERE id = ?", (job["user_id"],))
-            self._ledger_in(connection, job["user_id"], "freeze" if uncertain else "release", 0, job_id,
-                            "结果待核对，保留预留的1点算力" if uncertain else "生成明确失败，不扣算力，已释放预留的1点算力")
+            if unlimited:
+                note = "结果待核对，管理员无限算力，无需预留点数" if uncertain else "生成明确失败，管理员无限算力，不扣点数"
+            else:
+                note = "结果待核对，保留预留的1点算力" if uncertain else "生成明确失败，不扣算力，已释放预留的1点算力"
+            self._ledger_in(connection, job["user_id"], "freeze" if uncertain else "release", 0, job_id, note)
 
     def list_uncertain_jobs(self):
         with self.connection() as connection:
-            return [job_record(row) for row in connection.execute(
+            return [self._public_job_in(connection, row) for row in connection.execute(
                 "SELECT * FROM jobs WHERE status = 'uncertain' ORDER BY created_at, rowid")]
 
     def resolve_uncertain_job(self, job_id, consume, admin_user_id, reason):
@@ -171,13 +191,16 @@ class GenerationStore:
             job_record(job)
             if job["status"] != "uncertain":
                 raise DomainError(409, "job_already_resolved", "该任务无需核对或已经完成核对。")
-            connection.execute("UPDATE users SET credits = credits - ?, reserved_credits = reserved_credits - 1 WHERE id = ?",
-                               (int(consume), job["user_id"]))
+            unlimited = self._job_unlimited(connection, job)
+            if not unlimited:
+                connection.execute("UPDATE users SET credits = credits - ?, reserved_credits = reserved_credits - 1 WHERE id = ?",
+                                   (int(consume), job["user_id"]))
             connection.execute("UPDATE jobs SET status = 'settled', updated_at = ? WHERE id = ?", (now(), job_id))
             connection.execute("INSERT INTO audit VALUES (?,?,?,?,?,?)",
                                (new_id(), job_id, admin_user_id, int(consume), reason, now()))
             self._ledger_in(connection, job["user_id"], "manual_consume" if consume else "manual_release",
-                            -1 if consume else 0, job_id, f"老师核对：{reason}")
+                            -1 if consume and not unlimited else 0, job_id,
+                            f"老师核对（管理员无限算力，不扣点数）：{reason}" if unlimited else f"老师核对：{reason}")
 
     def mark_interrupted_jobs_uncertain(self):
         with self.transaction() as connection:
@@ -185,4 +208,6 @@ class GenerationStore:
             for job in jobs:
                 connection.execute("UPDATE jobs SET status = 'uncertain', error_message = ?, updated_at = ? WHERE id = ?",
                                    ("服务已重启，生成结果待老师核对。", now(), job["id"]))
-                self._ledger_in(connection, job["user_id"], "freeze", 0, job["id"], "服务重启，保留预留的1点算力等待老师核对")
+                note = ("服务重启，管理员无限算力，等待老师核对" if self._job_unlimited(connection, job)
+                        else "服务重启，保留预留的1点算力等待老师核对")
+                self._ledger_in(connection, job["user_id"], "freeze", 0, job["id"], note)

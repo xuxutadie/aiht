@@ -220,6 +220,29 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(len(data["entries"]), 1)
         self.assertEqual(data["entries"][0]["delta"], 10)
 
+    def test_admin_can_generate_with_zero_balance_and_student_summary_excludes_admin(self):
+        admin, user = self.admin()
+        self.assertTrue(user["unlimited_credits"])
+        self.assertEqual((user["credits"], user["reserved_credits"]), (0, 0))
+        _, student = self.student()
+        self.assertFalse(student["unlimited_credits"])
+        status, data, _ = admin.request("GET", "/api/admin/overview")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["stats"]["remaining_credits"], 10)
+        plan = self.plan(admin)
+        status, data, _ = self.generate(admin, plan)
+        self.assertEqual(status, 202, data)
+        self.provider.release.set()
+        result = self.wait_job(admin, data["job"]["id"])
+        self.assertEqual(result["job"]["status"], "succeeded")
+        self.assertTrue(result["job"]["unlimited_credits"])
+        self.assertTrue(result["user"]["unlimited_credits"])
+        self.assertEqual((result["user"]["credits"], result["user"]["reserved_credits"]), (0, 0))
+        # 升级前管理员的数字余额仅作为历史数据保存，不计入学生余额汇总。
+        with self.app.store.transaction() as connection:
+            connection.execute("UPDATE users SET credits=7 WHERE id=?", (user["id"],))
+        self.assertEqual(admin.request("GET", "/api/admin/overview")[1]["stats"]["remaining_credits"], 10)
+
     def test_anonymous_private_routes_are_denied(self):
         client = self.client()
         for path in ("/api/me", "/api/plans", "/api/artworks", "/api/credits", "/api/admin/settings"):

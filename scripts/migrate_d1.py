@@ -16,6 +16,7 @@ import tempfile
 # 直接运行脚本时仍从本发布包加载存储契约，不依赖当前工作目录。
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from studio._store_database import _SCHEMA, json_object
+from studio.contracts import ADMIN_UNLIMITED_RESERVE_NOTE
 from studio.provider import inspect_image, MAX_IMAGE_BYTES
 
 
@@ -131,13 +132,19 @@ def _validate_source(db):
         WHERE p.user_id<>j.user_id LIMIT 1""").fetchone(), "任务与方案归属不一致。")
     _require(not db.execute("""SELECT 1 FROM ledger l JOIN jobs j ON j.id=l.job_id
         WHERE l.user_id<>j.user_id LIMIT 1""").fetchone(), "任务账本归属不一致。")
-    _require(not db.execute("""SELECT 1 FROM jobs j WHERE
+    # 免扣标记仅用于管理员新任务；无标记的历史任务继续按原来的1点校验。
+    _require(not db.execute("""WITH job_charges AS (
+        SELECT j.*, u.role, CASE WHEN EXISTS (SELECT 1 FROM ledger l
+            WHERE l.job_id=j.id AND l.kind='reserve' AND l.note=?) THEN 0 ELSE 1 END AS charge_points
+        FROM jobs j JOIN users u ON u.id=j.user_id
+        ) SELECT 1 FROM job_charges j WHERE
+        (j.charge_points=0 AND j.role<>'admin') OR
         (SELECT COUNT(*) FROM ledger l WHERE l.job_id=j.id AND l.kind='reserve' AND l.delta=0)<>1
-        OR (j.status='succeeded' AND (SELECT COUNT(*) FROM ledger l WHERE l.job_id=j.id AND l.kind='consume' AND l.delta=-1)<>1)
+        OR (j.status='succeeded' AND (SELECT COUNT(*) FROM ledger l WHERE l.job_id=j.id AND l.kind='consume' AND l.delta=-j.charge_points)<>1)
         OR (j.status='failed' AND (SELECT COUNT(*) FROM ledger l WHERE l.job_id=j.id AND l.kind='release' AND l.delta=0)<>1)
         OR (j.status='settled' AND NOT EXISTS (SELECT 1 FROM audit a JOIN ledger l ON l.job_id=a.job_id
-            WHERE a.job_id=j.id AND l.delta=-a.consume AND l.kind=CASE WHEN a.consume=1 THEN 'manual_consume' ELSE 'manual_release' END))
-        LIMIT 1""").fetchone(), "任务终态与预留、扣点或人工结算账本不一致。")
+            WHERE a.job_id=j.id AND l.delta=-a.consume*j.charge_points AND l.kind=CASE WHEN a.consume=1 THEN 'manual_consume' ELSE 'manual_release' END))
+        LIMIT 1""", (ADMIN_UNLIMITED_RESERVE_NOTE,)).fetchone(), "任务终态与预留、扣点或人工结算账本不一致。")
     _require(not db.execute("""SELECT 1 FROM jobs j WHERE (j.status='succeeded' AND NOT EXISTS
         (SELECT 1 FROM artworks a WHERE a.job_id=j.id AND a.id=j.artwork_id))
         OR (j.status<>'succeeded' AND j.artwork_id IS NOT NULL) LIMIT 1""").fetchone(), "任务终态与作品引用不一致。")
