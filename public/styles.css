@@ -16,6 +16,7 @@
   --white: #fffefb;
   --radius: 16px;
   --shadow: 4px 4px 0 var(--ink);
+  --site-footer-height: 45px;
   font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
   font-synthesis: none;
 }
@@ -66,7 +67,9 @@ img { display: block; max-width: 100%; }
 .notice.info { background: #e6f1ff; }
 .notifications { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 1000; width: max-content; max-width: calc(100vw - 32px); pointer-events: none; }
 .notifications:not(:empty) { box-shadow: var(--shadow); border-radius: 10px; }
-.initial-loading { min-height: 100vh; display: flex; gap: 20px; flex-direction: column; align-items: center; justify-content: center; padding: 24px; }
+.initial-loading { min-height: calc(100dvh - var(--site-footer-height)); display: flex; gap: 20px; flex-direction: column; align-items: center; justify-content: center; padding: 24px; }
+.site-footer { min-height: var(--site-footer-height); display: flex; align-items: center; justify-content: center; padding: 0 16px; border-top: 1px solid var(--line); background: var(--cream); text-align: center; }
+.site-footer a { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 8px 12px; color: var(--muted); font-size: 13px; }
 .test-environment-banner { padding: 9px 16px; border-bottom: 2px solid var(--ink); background: var(--yellow-soft); color: var(--ink); text-align: center; font-size: 13px; font-weight: 800; line-height: 1.7; }
 .brand { display: flex; align-items: center; gap: 12px; color: var(--ink); text-decoration: none; font-size: 24px; font-weight: 900; white-space: nowrap; }
 .brand-mark { display: inline-flex; flex-shrink: 0; width: 44px; height: 46px; align-items: center; justify-content: center; background: var(--yellow); border: 2px solid var(--ink); border-radius: 12px; box-shadow: 2px 2px 0 var(--ink); font-size: 29px; font-weight: 900; line-height: 1; }
@@ -245,8 +248,8 @@ td small { display: block; color: var(--muted); margin-top: 4px; }
 .drawer-steps { display: flex; flex-direction: column; list-style: none; padding: 0; margin: 0; gap: 12px; }
 .drawer-steps li { position: relative; }
 .drawer-steps .step-button { justify-content: flex-start; gap: 16px; padding: 12px 18px; font-size: 16px; }
-.auth-page { min-height: calc(100dvh - var(--test-banner-height, 0px)); display: grid; grid-template-columns: minmax(0, 1fr) minmax(350px, 440px); align-items: start; gap: 60px; padding: 48px max(40px, calc((100vw - 1180px) / 2)); background-color: var(--cream); background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px); background-size: 28px 28px; }
-.auth-story { min-height: calc(100dvh - 96px - var(--test-banner-height, 0px)); display: flex; flex-direction: column; }
+.auth-page { min-height: calc(100dvh - var(--test-banner-height, 0px) - var(--site-footer-height)); display: grid; grid-template-columns: minmax(0, 1fr) minmax(350px, 440px); align-items: start; gap: 60px; padding: 48px max(40px, calc((100vw - 1180px) / 2)); background-color: var(--cream); background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px); background-size: 28px 28px; }
+.auth-story { min-height: calc(100dvh - 96px - var(--test-banner-height, 0px) - var(--site-footer-height)); display: flex; flex-direction: column; }
 .auth-story .brand { margin-bottom: 54px; font-size: 27px; }
 .auth-story-content { margin: auto 0; padding: 10px 0 40px; }
 .auth-story-content h1 { font-size: clamp(34px, 3.9vw, 54px); margin: 24px 0; }
@@ -309,6 +312,8 @@ td small { display: block; color: var(--muted); margin-top: 4px; }
 }
 @media (max-width: 720px) {
   body { font-size: 15px; }
+  /* 创作页的固定操作栏不能遮住页面底部的备案链接。 */
+  body:has(.workspace-actions):not(.keyboard-open) .site-footer { padding-bottom: calc(80px + env(safe-area-inset-bottom)); }
   .app-shell { display: block; }
   .sidebar { display: none; }
   .topbar { min-height: 72px; padding: 12px 16px; gap: 12px; }
