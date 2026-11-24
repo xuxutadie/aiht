@@ -1,4 +1,4 @@
--- 云端初始结构：由 D1 执行，账号资料、图片及 API 密钥不随源码发布。
+-- 旧 Cloudflare D1 数据结构的合成迁移测试资料。现版 Python 会自动创建 SQLite；不要用此 SQL 安装现版。
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS users (

@@ -1,21 +1,22 @@
 # 仅为备案完成、证书已申请后的正式站点样板；不要在内部验收阶段直接启用。
-# 请替换证书路径并由现有宝塔 Nginx 执行配置检查；不要覆盖其他站点配置。
+# 将所有 domain.example 替换为自己的域名；替换证书路径和 ACME 验证目录。
+# 交给现有 Nginx 执行配置检查通过才启用；不要覆盖其他站点配置。
 server {
     listen 80;
-    server_name xqd-ai.cn;
+    server_name domain.example;
     location ^~ /.well-known/acme-challenge/ {
-        root /www/wwwroot/xqd-ai-cn-acme;
+        root /var/www/domain.example-acme;
     }
     location / {
-        return 301 https://xqd-ai.cn$request_uri;
+        return 301 https://domain.example$request_uri;
     }
 }
 
 server {
     listen 443 ssl;
-    server_name xqd-ai.cn;
-    ssl_certificate /www/server/panel/vhost/cert/xqd-ai.cn/fullchain.pem;
-    ssl_certificate_key /www/server/panel/vhost/cert/xqd-ai.cn/privkey.pem;
+    server_name domain.example;
+    ssl_certificate /REPLACE_WITH_YOUR_CERT_DIR/fullchain.pem;
+    ssl_certificate_key /REPLACE_WITH_YOUR_CERT_DIR/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     client_max_body_size 64k;
     client_body_timeout 15s;

@@ -38,7 +38,7 @@ class MigrationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.base = Path(self.temp.name)
         self.source = sqlite3.connect(":memory:")
-        self.source.executescript((ROOT / "cloudflare/schema.sql").read_text(encoding="utf-8"))
+        self.source.executescript((ROOT / "docs/migration/d1-schema.sql").read_text(encoding="utf-8"))
         self.password_hash = hash_password(PASSWORD)
         self.image = png_bytes()
         self.key = f"artworks/{USER}/{ART}.png"

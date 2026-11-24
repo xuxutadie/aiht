@@ -1,4 +1,5 @@
 import test from 'node:test';
+// 共享前端回归测试，仅使用 Node 标准库；应用部署时不需要 Node。
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';

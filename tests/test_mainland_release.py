@@ -12,6 +12,21 @@ from scripts.mainland_load_test import summarize
 
 
 class MainlandReleaseTests(unittest.TestCase):
+    def test_release_uses_only_current_deployment_templates_and_migration_guide(self):
+        self.assertIn("docs/migration/旧Cloudflare数据迁移.md", EXTRA_FILES)
+        self.assertFalse(any(name.startswith("cloudflare/") for name in EXTRA_FILES))
+        root = Path(__file__).resolve().parents[1]
+        unit = (root / "deploy/mainland/aiht-creation-studio.service").read_text(encoding="utf-8")
+        nginx = (root / "deploy/mainland/nginx.conf.example").read_text(encoding="utf-8")
+        local_nginx = (root / "deploy/mainland/nginx-local-check.conf.example").read_text(encoding="utf-8")
+        # 正式 unit 未配置域名时应被 server.py 拒绝，而不是静默使用别人的域名。
+        self.assertIn("--public-url REPLACE_WITH_YOUR_HTTPS_URL", unit)
+        self.assertIn('--icp-number ""', unit)
+        self.assertIn("server_name domain.example;", nginx)
+        self.assertIn("listen 127.0.0.1:8088", local_nginx)
+        for config in (unit, nginx, local_nginx):
+            self.assertNotIn("xqd-ai.cn", config)
+
     def fixture(self, root):
         names = list(EXTRA_FILES) + ["public/" + name for name in PUBLIC_FILES] + ["studio/__init__.py", "studio/web.py"]
         for name in names:

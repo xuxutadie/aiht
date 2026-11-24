@@ -18,7 +18,7 @@ EXTRA_FILES = (
     "server.py", "scripts/migrate_d1.py", "scripts/mainland_load_test.py", "scripts/build_mainland_release.py",
     "deploy/mainland/aiht-creation-studio.service", "deploy/mainland/nginx.conf.example",
     "deploy/mainland/nginx-local-check.conf.example",
-    "deploy/mainland/部署说明.md", "cloudflare/数据迁移说明.md",
+    "deploy/mainland/部署说明.md", "docs/migration/旧Cloudflare数据迁移.md",
 )
 
 

@@ -2,6 +2,7 @@
 
 from collections import defaultdict, deque
 from contextlib import contextmanager
+from html import escape
 from http.cookies import SimpleCookie, CookieError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -49,7 +50,10 @@ class RateLimiter:
 
 
 class Application:
-    def __init__(self, data_dir, *, public_url="", provider=None, settings=None, test_mode=False):
+    def __init__(self, data_dir, *, public_url="", icp_number="", provider=None, settings=None, test_mode=False):
+        if not isinstance(icp_number, str) or len(icp_number) > 80 or (icp_number and not icp_number.isprintable()):
+            raise DomainError(400, "invalid_icp_number", "备案号应为不含控制字符、长度不超过80个字符的文本。")
+        self.icp_number = icp_number.strip()
         self.data_dir = Path(data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.instance_lock = InstanceLock(self.data_dir)
@@ -459,6 +463,16 @@ class Handler(BaseHTTPRequestHandler):
         mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         if path.suffix in {".js", ".css", ".html"}:
             mime += "; charset=utf-8"
+        if path == base / "index.html":
+            # 只渲染首页中的备案占位符；备案号是站点自己的文本，不能作为 HTML 或外部链接注入。
+            footer = ""
+            if self.app.icp_number:
+                footer = ('<footer class="site-footer" aria-label="备案信息">'
+                          '<a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">'
+                          f'{escape(self.app.icp_number)}</a></footer>')
+            content = path.read_text(encoding="utf-8").replace("<!-- SITE_ICP_FOOTER -->", footer, 1)
+            self._bytes(200, content.encode("utf-8"), mime)
+            return
         self._file(path, mime)
 
     def _headers(self, status, content_type, length, *, cookie=None, download=None):

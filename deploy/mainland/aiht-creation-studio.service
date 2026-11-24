@@ -12,7 +12,9 @@ DynamicUser=true
 StateDirectory=aiht-creation-studio
 StateDirectoryMode=0700
 WorkingDirectory=/opt/aiht-creation-studio
-ExecStart=/usr/bin/python3 -u /opt/aiht-creation-studio/server.py --host 127.0.0.1 --port 8321 --data-dir /var/lib/aiht-creation-studio --public-url https://xqd-ai.cn
+# 必须将 REPLACE_WITH_YOUR_HTTPS_URL 替换为自己的 HTTPS 根地址；否则程序拒绝启动。
+# 备案号可选：有合法备案号时填在引号内，不使用原作者的号码。
+ExecStart=/usr/bin/python3 -u /opt/aiht-creation-studio/server.py --host 127.0.0.1 --port 8321 --data-dir /var/lib/aiht-creation-studio --public-url REPLACE_WITH_YOUR_HTTPS_URL --icp-number ""
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 UMask=0077
@@ -29,7 +31,7 @@ ReadWritePaths=/var/lib/aiht-creation-studio
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 TasksMax=256
 LimitNOFILE=4096
-# 为 2GB 主机上的宝塔、Nginx 与系统保留空间；不能当成并发容量承诺。
+# 示例限制为 2GB 主机上的 Nginx 与系统保留空间；按实际负载评估，不代表并发容量承诺。
 MemoryHigh=600M
 MemoryMax=900M
 

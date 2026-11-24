@@ -16,7 +16,7 @@ __pycache__/
 *.log
 *.pid
 
-# Cloudflare 本地模拟、开发密钥与构建缓存
+# 旧工具残留、开发密钥与构建缓存（不随正式源码发布）
 node_modules/
 .wrangler/
 .dev.vars

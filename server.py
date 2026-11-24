@@ -20,13 +20,14 @@ def main():
     parser.add_argument("--port", type=int, default=8321)
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data")
     parser.add_argument("--public-url", default="", help="正式HTTPS访问地址；配置反向代理后使用")
+    parser.add_argument("--icp-number", default="", help="本网站真实的ICP备案号；留空不显示备案信息")
     parser.add_argument("--open-browser", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
     if args.public_url and not args.public_url.startswith("https://"):
         parser.error("正式访问地址必须使用HTTPS。")
     try:
-        app = Application(args.data_dir, public_url=args.public_url)
+        app = Application(args.data_dir, public_url=args.public_url, icp_number=args.icp_number)
     except DomainError as error:
         print(error.message, file=sys.stderr)
         return 1

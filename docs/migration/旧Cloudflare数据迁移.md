@@ -1,10 +1,10 @@
-# D1 转 Python 数据目录
+# 高级维护：将旧 Cloudflare 数据迁入现版 SQLite
 
-适用于已确认的腾讯云北京服务器迁移。工具为 `scripts/migrate_d1.py`，只使用 Python 标准库和本项目已有图片检查函数，不调用绘图或语言模型接口。
+**本页仅适用于原先已经使用 Cloudflare Workers + D1 的旧版网站，首次安装或普通部署新版时直接跳过本页。** 当前项目统一由 Python 运行，使用 SQLite 持久化；不要求安装 Wrangler、创建 D1 或执行 SQL 建库。完整 GitHub 源码中的 `docs/migration/d1-schema.sql` 仅保存旧结构，供迁移合成测试使用，不在服务器发布包内，也不是现版安装脚本。转换工具为 `scripts/migrate_d1.py`，只使用 Python 标准库和本项目已有图片检查函数，不调用绘图或语言模型接口。
 
 ## 来源与输出
 
-使用 Cloudflare 官方 Wrangler 导出的业务 SQL。必须包括 `users`、`plans`、`jobs`、`artworks`、`image_objects`、`image_chunks`、`ledger`、`audit` 八张表。导出时排除 `settings`、`sessions`、`rate_limits`；即使来源含这些表，工具也不将其写入目标。
+如果你有旧网站及其资料，先备份并由旧网站维护人员通过 Cloudflare 官方导出工具取得业务 SQL（现版项目不需要这些工具）。必须包括 `users`、`plans`、`jobs`、`artworks`、`image_objects`、`image_chunks`、`ledger`、`audit` 八张表。导出时排除 `settings`、`sessions`、`rate_limits`；即使来源含这些表，工具也不将其写入目标。
 
 启用注册授权码后，还须导出 `authorization_codes`：迁移保留摘要、尾号、生成者、使用者及使用时间，未使用码仍可注册，已使用码仍不能重用。没有该表的旧快照仍可迁移，目标新增空表；已有此表时不得在导出中遗漏。包含自增ID的导出可能带有SQLite内部序号表，工具仅允许必要的序号读写，不因此开放其他表的删除或任意更新。
 
@@ -20,7 +20,7 @@ SQL、转换目录和数据包均含私人资料，必须位于受保护目录�
 
 ## 检查、转换和复核
 
-在发布包目录运行，路径按实际私密文件位置替换：
+在现版仓库根目录（或包含迁移工具的服务器发布包目录）运行，路径按实际私密文件位置替换：
 
 ```text
 python scripts/migrate_d1.py /private/d1-business.sql --check-only
@@ -40,6 +40,6 @@ SQL 导入只允许本项目普通业务表、索引及数据，禁止 ATTACH、
 
 ## 演练与正式切换
 
-原站仍可写入时导出的快照只能用于演练，不得当作最终生产数据。正式切换前须进入短暂维护窗口，阻止新生图和业务写入，确认没有在途或待核对任务，重新导出、转换、复核后再启动新服务。备案和真实网络验收通过后切换域名。Cloudflare 保留回退，演练和转换不会自动修改旧站、DNS 或删除数据。
+原站仍可写入时导出的快照只能用于演练，不得当作最终生产数据。正式切换前须进入短暂维护窗口，阻止新生图和业务写入，确认没有在途或待核对任务，重新导出、转换、复核后，按 [服务器部署说明](../../deploy/mainland/部署说明.md) 使用已复核的数据启动新服务。备案和真实网络验收通过后再切换域名。保留旧站及备份作为回退依据；演练和转换不会自动访问或修改旧站、DNS 或删除数据。
 
 合成测试命令：`python -m unittest tests.test_migrate_d1 -v`。测试使用虚构账号和本地 PNG，不接触真实绘图接口。

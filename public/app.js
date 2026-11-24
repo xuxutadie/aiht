@@ -142,7 +142,7 @@ async function bootstrap(event) {
     const data = await api('/api/bootstrap', { timeoutMs: 15000 });
     state.configured = data.generation_configured; state.testMode = Boolean(data.test_mode);
     if (data.user) { state.user = data.user; shell(); onUser(data.user); await navigate('workspace', { skipSave: true }); }
-    else mount(authScreen(data.setup_required, user => signedIn(user).catch(err => toast(err.message, true)), { setupTokenRequired: Boolean(data.setup_token_required) }));
+    else mount(authScreen(data.setup_required, user => signedIn(user).catch(err => toast(err.message, true))));
   } catch (err) { root.replaceChildren(el('main', { id: 'main', className: 'initial-loading' }, el('span', { className: 'brand-mark' }, '创'), el('h1', {}, '作品创作台'), notice(err.message, 'error'), button('重新连接', bootstrap, 'button primary'))); }
   finally { bootstrapBusy = false; if (control) control.disabled = false; }
 }
