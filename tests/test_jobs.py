@@ -116,6 +116,22 @@ class JobsTests(unittest.TestCase):
         self.provider.release.set()
         self.wait_status(job["id"], "succeeded")
 
+    def test_long_answers_still_archive_the_image_and_complete_one_charge(self):
+        # 学生精简过提示词后可以保留前面较长的思考；作品说明不能让归档失败。
+        answers = {**complete_answers(), "custom_prompt": "我精简后的绿色城市画面"}
+        for name in ("reason", "message", "message_detail", "subject", "scene", "action",
+                     "details", "style_reason", "innovation", "innovation_visible", "task_understanding"):
+            answers[name] = "创" * 600
+        self.app.store.save_plan(self.user["id"], self.plan["id"], answers, 5, False)
+        self.plan = self.app.store.save_plan(self.user["id"], self.plan["id"], answers, 5, True)
+        self.provider.release.set()
+        job = self.wait_status(self.submit()["id"], "succeeded")
+        artwork = self.app.store.get_artwork(self.user["id"], job["artwork_id"])
+        self.assertLessEqual(len(artwork["description"]), 5000)
+        self.assertEqual(artwork["answers"], answers, "原始创作回答完整保留")
+        user = self.app.store.get_user(self.user["id"])
+        self.assertEqual((user["credits"], user["reserved_credits"], self.provider.calls), (9, 0, 1))
+
     def test_closing_cancels_unstarted_job_and_releases_only_its_reservation(self):
         first, second = self.submit(), self.submit()
         self.assertTrue(self.provider.two_entered.wait(2))

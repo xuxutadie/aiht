@@ -102,6 +102,22 @@ function workspace(t, { step = 4, confirmed = false, answers = {}, revokeConfirm
   return { result, root: result.node, calls, findButton };
 }
 
+test('七步分别使用自己的主题色，前进与返回时同步切换', async t => {
+  for (let i = 0; i < 7; i++) {
+    const page = workspace(t, { step: i, confirmed: true });
+    assert.equal(page.root.attrs['data-step'], String(i + 1));
+    const active = page.root.querySelectorAll('.step-button').filter(button => button.attrs['aria-current'] === 'step');
+    assert.equal(active.length, 1);
+    assert.equal(active[0].attrs['data-step'], String(i + 1));
+  }
+  const first = workspace(t, { step: 0 });
+  await first.findButton('保存，继续下一步').fire('click');
+  assert.equal(first.root.attrs['data-step'], '2');
+  assert.equal(first.root.querySelectorAll('.step-button').find(button => button.attrs['aria-current'] === 'step').attrs['data-step'], '2');
+  await first.findButton('上一步').fire('click');
+  assert.equal(first.root.attrs['data-step'], '1');
+});
+
 test('旧草稿显示自动取景，新选项实际保存且不增加必填', async t => {
   const page = workspace(t, { step: 3 });
   const framing = page.root.querySelector('[name="subject_framing"]');

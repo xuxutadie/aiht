@@ -105,10 +105,18 @@ img { display: block; max-width: 100%; }
 .main-content { padding: 30px 32px 24px; max-width: 1600px; margin: 0 auto; }
 .workspace-title { display: flex; align-items: flex-start; flex-direction: column; gap: 17px; margin-bottom: 26px; }
 .workspace-title .eyebrow { font-size: 17px; }
+/* 七个创作阶段各有独立的多巴胺主色；浅色正文区与白色文本框保持阅读清晰。 */
+.workspace, .step-button { --step-accent: var(--pink-strong); --step-surface: var(--pink-soft); --step-on-accent: var(--ink); }
+:is(.workspace, .step-button)[data-step="2"] { --step-accent: #3365db; --step-surface: #dcebff; --step-on-accent: #fff; }
+:is(.workspace, .step-button)[data-step="3"] { --step-accent: var(--mint); --step-surface: var(--mint-soft); }
+:is(.workspace, .step-button)[data-step="4"] { --step-accent: var(--yellow); --step-surface: var(--yellow-soft); }
+:is(.workspace, .step-button)[data-step="5"] { --step-accent: #8851df; --step-surface: #ebdfff; --step-on-accent: #fff; }
+:is(.workspace, .step-button)[data-step="6"] { --step-accent: #ff9845; --step-surface: #ffe7ce; }
+:is(.workspace, .step-button)[data-step="7"] { --step-accent: #087d7b; --step-surface: #d2f3f4; --step-on-accent: #fff; }
 .step-track { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); list-style: none; padding: 0; margin: 0 0 30px; gap: 5px; }
 .step-track li { min-width: 0; position: relative; }
 .step-button { position: relative; z-index: 1; min-height: 47px; width: 100%; border: 2px solid #8488a5; border-radius: 11px; padding: 8px 4px; background: #edf0ff; color: #787c9a; font-weight: 800; display: flex; align-items: center; justify-content: center; gap: 6px; font-size: 14px; }
-.step-button.current { color: var(--ink); background: var(--pink); border-color: var(--ink); box-shadow: 2px 2px 0 var(--ink); }
+.step-button.current { color: var(--step-on-accent); background: var(--step-accent); border-color: var(--ink); box-shadow: 2px 2px 0 var(--ink); }
 .step-button.done { color: var(--ink); background: var(--mint-soft); border-color: var(--ink); }
 .step-track .step-button { padding-right: 8px; }
 .step-track li:not(:last-child) .step-button::after { content: ''; position: absolute; right: -6px; top: calc(50% - 7px); width: 12px; height: 12px; background: inherit; border-top: 2px solid #8488a5; border-right: 2px solid #8488a5; border-radius: 2px; transform: rotate(45deg); }
@@ -116,8 +124,8 @@ img { display: block; max-width: 100%; }
 .step-number { font-size: 14px; }
 .step-name { font-weight: 800; }
 .workspace-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(230px, .44fr); align-items: start; gap: 22px; }
-.step-card { overflow: hidden; background: var(--pink-soft); }
-.step-card-heading { display: flex; align-items: flex-start; gap: 10px; background: var(--pink-strong); color: white; padding: 16px 22px; }
+.step-card { overflow: hidden; background: var(--step-surface); }
+.step-card-heading { display: flex; align-items: flex-start; gap: 10px; background: var(--step-accent); color: var(--step-on-accent); padding: 16px 22px; }
 .step-card-heading h2 { font-size: clamp(19px, 1.8vw, 28px); }
 .step-index { font-size: clamp(20px, 1.8vw, 28px); font-weight: 900; line-height: 1.4; }
 .step-card-body { padding: 20px 24px 23px; display: flex; flex-direction: column; gap: 19px; }
@@ -158,12 +166,12 @@ img { display: block; max-width: 100%; }
 .workspace-actions .button { font-size: 16px; }
 .workspace-lock { text-align: center; margin: 24px 0 0; font-size: 14px; color: #565a7d; }
 .mobile-step-heading { display: none; }
-.preset-question { padding: 12px 14px; border-left: 4px solid #ce2577; background: #fff4f9; font-size: 16px; font-weight: 700; }
+.preset-question { padding: 12px 14px; border-left: 4px solid var(--step-accent); background: var(--white); font-size: 16px; font-weight: 700; }
 .self-check { display: flex; flex-direction: column; gap: 8px; padding: 17px; border: 2px solid var(--ink); border-radius: 12px; background: #fff9ef; }
 .self-check h3 { margin-bottom: 5px; }
 .check-label { display: flex; align-items: flex-start; gap: 10px; min-height: 44px; cursor: pointer; font-size: 14px; line-height: 1.8; padding: 6px 0; }
 .check-label input { flex-shrink: 0; width: 20px; height: 20px; margin: 3px 0; accent-color: var(--blue); }
-.prompt-preview { display: flex; flex-direction: column; gap: 13px; border-top: 1px solid #d6aec5; padding-top: 20px; }
+.prompt-preview { display: flex; flex-direction: column; gap: 13px; border-top: 1px solid var(--step-accent); padding-top: 20px; }
 .step-card-body.generation-body { gap: 12px; }
 .generation-balance { border: 2px solid var(--ink); background: var(--yellow-soft); border-radius: 12px; padding: 12px 14px; display: flex; align-items: baseline; justify-content: space-around; gap: 8px 12px; flex-wrap: wrap; }
 .generation-balance span { white-space: nowrap; }
@@ -204,7 +212,13 @@ img { display: block; max-width: 100%; }
 .artwork-image-wrap { position: sticky; top: 0; border: 2px solid var(--ink); border-radius: 12px; overflow: hidden; background: #edf1fb; }
 .artwork-image { width: 100%; max-height: 560px; object-fit: contain; }
 .artwork-editor { display: flex; flex-direction: column; gap: 20px; }
+.artwork-template-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.artwork-template-tools p { flex: 1 1 200px; font-size: 14px; }
+.artwork-presentation-tips { border: 2px solid var(--ink); border-radius: 12px; padding: 0 14px; background: var(--cream); }
+.artwork-presentation-tips summary { min-height: 44px; cursor: pointer; font-weight: 800; line-height: 1.5; padding: 11px 0; }
+.artwork-presentation-tips ol { margin: 0 0 14px; padding-left: 24px; }
 .step-card .artwork-detail { grid-template-columns: 1fr; }
+.step-card .artwork-image-wrap { position: static; }
 .credit-summary { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(140px, 1fr) 2fr; gap: 20px; }
 .stat-card { display: flex; flex-direction: column; justify-content: center; gap: 8px; padding: 18px 22px; border: 2px solid var(--ink); border-radius: 14px; box-shadow: var(--shadow); font-weight: 800; }
 .stat-card strong { font-size: 32px; line-height: 1.3; }

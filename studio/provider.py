@@ -26,6 +26,7 @@ from .secrets import validate_base_url, validate_model, validate_quality, provid
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 # JSON中的base64会膨胀至原图的4/3，另留64KiB外壳；解码后仍限20MiB。
 MAX_RESPONSE_BYTES = 4 * ((MAX_IMAGE_BYTES + 2) // 3) + 64 * 1024
+MAX_ERROR_BODY_BYTES = 64 * 1024
 TIMEOUT_SECONDS = 180
 RATIO_SIZES = {"1:1": "2048x2048", "4:3": "2368x1776", "3:4": "1776x2368",
                "16:9": "2816x1584", "9:16": "1584x2816"}
@@ -114,6 +115,50 @@ def _read_limited(response, maximum):
             raise ValueError("响应超过限制")
         parts.append(part)
     return b"".join(parts)
+
+
+# 仅识别火山方舟文档列出的固定错误码；不输出任何上游自由文本、字段或未知子码。
+# https://docs.volcengine.com/docs/ark/error-codes
+_INPUT_REJECTED = "创作提示词未通过内容安全审核，请检查创作内容是否符合使用规范。"
+_OUTPUT_REJECTED = "生成的图片未通过内容安全审核，请检查创作内容是否符合使用规范。"
+_INVALID_PARAMETER = "绘图请求参数不受支持或不正确，请联系管理员检查模型配置。"
+_REJECTION_MESSAGES = {
+    "SensitiveContentDetected": _INPUT_REJECTED,
+    "SensitiveContentDetected.SevereViolation": _INPUT_REJECTED,
+    "SensitiveContentDetected.Violence": _INPUT_REJECTED,
+    "InputTextSensitiveContentDetected": _INPUT_REJECTED,
+    "InputTextRiskDetection": _INPUT_REJECTED,
+    "OutputImageSensitiveContentDetected": _OUTPUT_REJECTED,
+    "OutputImageRiskDetection": _OUTPUT_REJECTED,
+    "InputTextSensitiveContentDetected.PolicyViolation": "创作提示词可能涉及版权限制，请使用符合授权要求的创作内容。",
+    "OutputImageSensitiveContentDetected.PolicyViolation": "生成的图片可能涉及版权限制，请检查创作内容是否符合授权要求。",
+    "OutputImageSensitiveContentDetected.DeepFake": "生成的图片可能涉及伪造内容风险，请检查创作内容是否符合使用规范。",
+    "InvalidParameter": _INVALID_PARAMETER,
+    "InvalidParameter.UnsupportedParameter": _INVALID_PARAMETER,
+    "InvalidParameter.TaskTypeConstraint": _INVALID_PARAMETER,
+    "InvalidParameter.TaskTypeMismatch": _INVALID_PARAMETER,
+    "MissingParameter": "绘图请求缺少必要参数，请联系管理员检查模型配置。",
+}
+
+
+def _rejection_message(payload, status, fallback):
+    detail = payload.get("error") if isinstance(payload, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    if isinstance(code, str) and len(code) <= 128:
+        message = _REJECTION_MESSAGES.get(code)
+        if message:
+            return message
+    # HTTP 状态来自响应本身，而不是可能携带隐私信息的 JSON 正文。
+    suffix = f"（HTTP {status}）" if type(status) is int and 100 <= status <= 599 else ""
+    return fallback + suffix + "，请检查方案或联系管理员。"
+
+
+def _http_error_payload(exc):
+    try:
+        return json.loads(_read_limited(exc, MAX_ERROR_BODY_BYTES))
+    except (ValueError, TypeError, OSError, http.client.HTTPException, RecursionError):
+        # 已经收到明确的 4xx；读取或解析正文失败不改变原有的失败结算性质。
+        return None
 
 
 def _safe_download_ips(url, provider="ark"):
@@ -321,18 +366,22 @@ class Provider:
         try:
             with _open(req) as response:
                 request_id = _request_id(response.headers, key)
+                status = getattr(response, "status", None)
                 content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
                 raw = _read_limited(response, MAX_IMAGE_BYTES if content_type.startswith("image/") else MAX_RESPONSE_BYTES)
         except error.HTTPError as exc:
             request_id = _request_id(exc.headers, key)
             status = exc.code
-            exc.close()
-            # 不转发可能包含密钥、提示词或其他隐私的上游错误正文。
-            if 400 <= status < 500:
-                messages = {401: "出图密钥无效，请联系管理员检查配置。", 403: "出图权限不足，请联系管理员检查模型权限。",
-                            429: "出图服务当前繁忙或暂不可用，请联系老师。"}
-                raise ProviderError(messages.get(status, "出图服务未接受本次请求，请检查方案或联系管理员。"),
-                                    request_id=request_id) from None
+            try:
+                if 400 <= status < 500:
+                    messages = {401: "出图密钥无效，请联系管理员检查配置。", 403: "出图权限不足，请联系管理员检查模型权限。",
+                                429: "出图服务当前繁忙或暂不可用，请联系老师。"}
+                    message = messages.get(status)
+                    if message is None:
+                        message = _rejection_message(_http_error_payload(exc), status, "出图服务未接受本次请求")
+                    raise ProviderError(message, request_id=request_id) from None
+            finally:
+                exc.close()
             raise ProviderError("出图服务暂时异常，本次生成状态待管理员核对。", uncertain=True,
                                 request_id=request_id) from None
         except (error.URLError, TimeoutError, OSError, ValueError, http.client.HTTPException):
@@ -349,7 +398,7 @@ class Provider:
                     raise ValueError("响应格式不正确")
                 if payload.get("error"):
                     # 官方顶层 error 表示整次请求未生成任何图片。
-                    raise ProviderError("出图服务未能生成本次图片，请检查方案或联系管理员。", request_id=request_id)
+                    raise ProviderError(_rejection_message(payload, status, "出图服务未能生成本次图片"), request_id=request_id)
                 entries = payload.get("data")
                 if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
                     raise ValueError("单图响应结构不正确")

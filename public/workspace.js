@@ -135,7 +135,7 @@ export function createWorkspace(initialPlan, ctx) {
   function stepsList(drawer = false, close) {
     return el('ol', { className: drawer ? 'drawer-steps' : 'step-track', 'aria-label': '七步创作流程' }, STEPS.map((item, index) => {
       const complete = index < 5 ? item.fields.every(([name, , , required]) => !required || String(answers[name] || '').trim()) && (index !== 4 || plan.confirmed) : index === 5 ? Boolean(latestArtwork) : Boolean(latestArtwork?.description && latestArtwork?.reflection);
-      return el('li', {}, button([el('span', { className: 'step-number', 'aria-hidden': true }, complete && index !== step ? '✓' : `${index + 1}`), el('span', { className: 'step-name' }, item.name)], () => { close?.(); goStep(index); }, `step-button ${index === step ? 'current' : complete ? 'done' : ''}`, { 'aria-label': `第 ${index + 1} 步：${item.name}${complete ? '，已完成' : ''}`, 'aria-current': index === step ? 'step' : null, 'data-work-action': true }));
+      return el('li', {}, button([el('span', { className: 'step-number', 'aria-hidden': true }, complete && index !== step ? '✓' : `${index + 1}`), el('span', { className: 'step-name' }, item.name)], () => { close?.(); goStep(index); }, `step-button ${index === step ? 'current' : complete ? 'done' : ''}`, { 'aria-label': `第 ${index + 1} 步：${item.name}${complete ? '，已完成' : ''}`, 'aria-current': index === step ? 'step' : null, 'data-step': index + 1, 'data-work-action': true }));
     }));
   }
   function showSteps() {
@@ -349,6 +349,8 @@ export function createWorkspace(initialPlan, ctx) {
   }
   function render() {
     if (disposed) return;
+    // 根据当前步骤统一切换卡片、进度条及辅助提示的主题色，恢复草稿时也保持一致。
+    root.setAttribute('data-step', String(step + 1));
     const card = el('section', { className: 'step-card card' }, el('div', { className: 'step-card-heading' }, el('span', { className: 'step-index' }, String(step + 1).padStart(2, '0')), el('h2', { tabindex: '-1' }, STEPS[step].title)), step < 5 ? planningContent() : step === 5 ? generationContent() : reflectionContent());
     const footer = el('div', { className: 'workspace-actions' });
     footer.append(button('上一步', () => goStep(step - 1), 'button secondary', { disabled: step === 0, 'data-work-action': true }));

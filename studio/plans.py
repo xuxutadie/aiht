@@ -119,18 +119,46 @@ def build_preview(answers: dict) -> dict:
 
 def build_summary(answers: dict) -> str:
     values = sanitize_answers(answers)
-    framing = _framing_text(values)
-    framing_line = f"取景选择：{framing}\n" if framing else ""
-    def field(name):
-        return values.get(name) or "【请补充】"
-    return (
-        f"作品名称：《{field('theme')}》\n\n"
-        f"创作缘由：{field('reason')}\n"
-        f"我想表达：{field('message')}\n"
-        f"画面设计：以{field('subject')}为主角，在{field('scene')}，{field('action')}。"
-        f"关键细节是{field('details')}。\n"
-        f"{framing_line}"
-        f"形式选择：{field('ratio')}画幅，{field('style')}风格。选择理由：{field('style_reason')}\n"
-        f"我的创新：{field('innovation')}。在画面中通过{field('innovation_visible')}体现。\n\n"
-        "AI辅助与修改过程：【请根据实际生成、检查和修改过程填写，不要保留这一提示文字。】"
-    )
+
+    def render(excerpt=False):
+        def field(name):
+            value = values.get(name) or "【请补充】"
+            if excerpt:
+                # 按浏览器文本框使用的 UTF-16 单位预算，不切断表情等复合编码字符。
+                encoded = value.encode("utf-16-le")
+                if len(encoded) > 250 * 2:
+                    marker = "…【原回答已摘录】"
+                    return encoded[:(250 - len(marker)) * 2].decode("utf-16-le", errors="ignore") + marker
+            return value
+
+        def line(label, name):
+            return f"{label}：{field(name)}"
+
+        sections = [
+            [f"作品名称：《{field('theme')}》"],
+            ["01 赛题理解",
+             *[line(label, name) for label, name in (("比赛或练习名称", "competition_name"), ("赛题主题", "competition_theme"),
+                                                     ("赛题要求", "requirements")) if values.get(name)],
+             line("我理解的任务", "task_understanding")],
+            ["02 创作背景", line("作品主题", "theme"), line("创作缘由", "reason")],
+            ["03 表达意图", line("我希望表达", "message"), line("画面如何传达", "message_detail")],
+            ["04 画面构思", line("画面主体", "subject"), line("场景设定", "scene"),
+             line("发生的事情", "action"), line("关键细节", "details")],
+            ["05 设计选择", line("画面比例", "ratio"), line("画面风格", "style"),
+             *[line(label, name) for label, name in (("主体呈现", "subject_framing"), ("场景景别", "scene_distance"))
+               if values.get(name) and values[name] != "自动"],
+             line("选择理由", "style_reason")],
+            ["06 创新亮点", line("创新思考路径", "innovation_type"), line("具体创新点", "innovation"),
+             line("创新在画面中的表现", "innovation_visible")],
+            ["07 AI辅助与修改过程", "AI辅助方式：依据创作计划整理提示词，并使用AI绘图工具辅助画面创作。",
+             "实际生成过程：【请根据实际情况补充生成与选择作品的过程。】",
+             "检查与修改：【请根据实际情况补充对照赛题要求检查作品的过程和实际修改内容，未修改也请如实填写。】"],
+        ]
+        return "\n\n".join("\n".join(section) for section in sections)
+
+    summary = render()
+    if len(summary.encode("utf-16-le")) <= 5000 * 2:
+        return summary
+    # 最多16处可变长字段（含重复的作品名），逐项限制为250单位并标注摘录，保留全部栏目。
+    # 完整答案仍在原创作计划中，不能因说明模板超长而使已生成作品归档失败。
+    return render(excerpt=True) + "\n\n说明：较长的回答已按字段摘录，完整内容仍保留在创作计划中，可自行补充。"

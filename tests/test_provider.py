@@ -131,6 +131,120 @@ class ProviderTests(unittest.TestCase):
                 self.assertEqual(caught.exception.request_id, "safe-request-456")
                 self.assertNotIn(API_KEY, str(caught.exception))
 
+    def test_known_rejection_codes_are_mapped_to_safe_messages(self):
+        # 同一固定错误码无论由 HTTP 错误还是顶层 error 返回，说明和结算性质都一致。
+        cases = {
+            "InputTextSensitiveContentDetected": "创作提示词未通过内容安全审核",
+            "InputTextSensitiveContentDetected.PolicyViolation": "可能涉及版权限制",
+            "OutputImageSensitiveContentDetected": "生成的图片未通过内容安全审核",
+            "OutputImageSensitiveContentDetected.DeepFake": "可能涉及伪造内容风险",
+            "OutputImageSensitiveContentDetected.PolicyViolation": "可能涉及版权限制",
+            "InvalidParameter": "绘图请求参数不受支持或不正确",
+            "InvalidParameter.UnsupportedParameter": "绘图请求参数不受支持或不正确",
+            "MissingParameter": "绘图请求缺少必要参数",
+        }
+        prompt = "仅用于测试的学生隐私提示词"
+        for code, description in cases.items():
+            body = json.dumps({"error": {"code": code, "message": API_KEY + prompt,
+                                         "param": prompt}}).encode()
+            for is_http_error in (True, False):
+                with self.subTest(code=code, http_error=is_http_error):
+                    if is_http_error:
+                        response = HTTPError("https://ark.cn-beijing.volces.com/api/v3/images/generations",
+                                             400, prompt, Message(), io.BytesIO(body))
+                        mocked_open = patch("studio.provider._open", side_effect=response)
+                    else:
+                        mocked_open = patch("studio.provider._open", return_value=FakeResponse(body))
+                    with mocked_open as fake, self.assertRaises(ProviderError) as caught:
+                        self.provider.generate(prompt, {})
+                    self.assertFalse(caught.exception.uncertain)
+                    self.assertIn(description, str(caught.exception))
+                    self.assertNotIn(API_KEY, str(caught.exception))
+                    self.assertNotIn(prompt, str(caught.exception))
+                    self.assertNotIn(code, str(caught.exception))
+                    self.assertEqual(fake.call_count, 1)
+
+    def test_unknown_or_malformed_rejection_never_exposes_upstream_fields(self):
+        prompt = "仅用于测试的学生隐私提示词"
+        # 不能把名称相似的任意子码误判成已确认的安全审核错误。
+        unknown_code = "InputTextSensitiveContentDetected." + API_KEY
+        for body in (json.dumps({"error": {"code": unknown_code, "message": prompt}}).encode(),
+                     json.dumps({"error": {"code": [API_KEY], "message": prompt}}).encode(),
+                     b"<html>not json</html>", b"[" * 2000 + b"]" * 2000):
+            with self.subTest(body_type=type(body).__name__, length=len(body)):
+                response = HTTPError("https://ark.cn-beijing.volces.com/api/v3/images/generations",
+                                     422, prompt, Message(), io.BytesIO(body))
+                with patch("studio.provider._open", side_effect=response) as fake, self.assertRaises(ProviderError) as caught:
+                    self.provider.generate(prompt, {})
+                message = str(caught.exception)
+                self.assertFalse(caught.exception.uncertain)
+                self.assertIn("HTTP 422", message)
+                self.assertNotIn("未通过内容安全审核", message)
+                self.assertNotIn(API_KEY, message)
+                self.assertNotIn(prompt, message)
+                self.assertEqual(fake.call_count, 1)
+        body = json.dumps({"error": {"code": unknown_code, "message": prompt}}).encode()
+        with patch("studio.provider._open", return_value=FakeResponse(body)), self.assertRaises(ProviderError) as caught:
+            self.provider.generate(prompt, {})
+        self.assertFalse(caught.exception.uncertain)
+        self.assertIn("HTTP 200", str(caught.exception))
+        self.assertNotIn(API_KEY, str(caught.exception))
+        self.assertNotIn(prompt, str(caught.exception))
+
+    def test_status_specific_errors_and_uncertain_server_errors_take_precedence(self):
+        # 不能因正文声称输入被拒而把 5xx 错误错误地改成确定失败并退还算力。
+        body = json.dumps({"error": {"code": "InputTextSensitiveContentDetected", "message": API_KEY}}).encode()
+        for status, description in ((401, "密钥无效"), (403, "权限不足"),
+                                    (429, "当前繁忙或暂不可用"), (503, "待管理员核对")):
+            with self.subTest(status=status):
+                response = HTTPError("https://ark.cn-beijing.volces.com/api/v3/images/generations",
+                                     status, API_KEY, Message(), io.BytesIO(body))
+                with patch("studio.provider._open", side_effect=response) as fake, self.assertRaises(ProviderError) as caught:
+                    self.provider.generate("主题", {})
+                self.assertEqual(caught.exception.uncertain, status >= 500)
+                self.assertIn(description, str(caught.exception))
+                self.assertNotIn("内容安全审核", str(caught.exception))
+                self.assertNotIn(API_KEY, str(caught.exception))
+                self.assertEqual(fake.call_count, 1)
+
+    def test_error_body_read_is_bounded_and_fault_tolerant(self):
+        class ErrorBody(io.BytesIO):
+            bytes_read = 0
+
+            def read(self, amount=-1):
+                self.assert_bounded_read(amount)
+                data = super().read(amount)
+                self.bytes_read += len(data)
+                return data
+
+            def assert_bounded_read(self, amount):
+                if not 0 < amount <= 65536 or self.bytes_read + amount > 65537:
+                    raise AssertionError("错误正文读取超过 64 KiB 上限")
+
+        body = ErrorBody(json.dumps({"error": {"code": "InvalidParameter", "message": "x" * 100000}}).encode())
+        response = HTTPError("https://ark.cn-beijing.volces.com/api/v3/images/generations",
+                             400, "bad", Message(), body)
+        with patch("studio.provider._open", side_effect=response), self.assertRaises(ProviderError) as caught:
+            self.provider.generate("主题", {})
+        self.assertFalse(caught.exception.uncertain)
+        self.assertIn("HTTP 400", str(caught.exception))
+        self.assertNotIn("参数不受支持", str(caught.exception))
+        self.assertTrue(body.closed)
+
+        class BrokenBody(io.BytesIO):
+            def read(self, amount=-1):
+                raise OSError(API_KEY)
+
+        body = BrokenBody()
+        response = HTTPError("https://ark.cn-beijing.volces.com/api/v3/images/generations",
+                             400, "bad", Message(), body)
+        with patch("studio.provider._open", side_effect=response), self.assertRaises(ProviderError) as caught:
+            self.provider.generate("主题", {})
+        self.assertFalse(caught.exception.uncertain)
+        self.assertIn("HTTP 400", str(caught.exception))
+        self.assertNotIn(API_KEY, str(caught.exception))
+        self.assertTrue(body.closed)
+
     def test_invalid_or_error_payload_never_becomes_an_image(self):
         for content in (b'{"error":{"message":"secret"}}', b"not json", b'{"data":[]}',
                         b'{"data":[{"b64_json":"!!"}]}', b'{"data":[{"b64_json":"e30="}]}'):
