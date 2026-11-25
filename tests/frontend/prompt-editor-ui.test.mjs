@@ -62,7 +62,7 @@ const ANSWERS = {
   ratio: '16:9', style: '动漫', style_reason: '亲切清楚', innovation_type: '新的故事', innovation: '未来照护生活', innovation_visible: '机器人的照护动作',
 };
 
-function workspace(t, { step = 4, confirmed = false, answers = {}, revokeConfirmation = false, failSave = false, templateError = '', user = { id: 'student-local', credits: 10, role: 'student' }, configured = true, generation = { id: 'job-local', status: 'failed' } } = {}) {
+function workspace(t, { step = 4, confirmed = false, answers = {}, revokeConfirmation = false, failSave = false, templateError = '', user = { id: 'student-local', credits: 10, role: 'student' }, configured = true, generation = { id: 'job-local', status: 'failed' }, requestRecord = null } = {}) {
   let stored = { id: 'plan-local', title: '本地计划', answers: { ...ANSWERS, ...answers }, step, confirmed };
   const calls = [];
   const el = (tag, attrs = {}, ...children) => new FormNode(tag, attrs, children);
@@ -74,12 +74,12 @@ function workspace(t, { step = 4, confirmed = false, answers = {}, revokeConfirm
   };
   const context = vm.createContext({
     window: { matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }), scrollTo() {} },
-    sessionStorage: { getItem: () => null, setItem() {} },
+    sessionStorage: { getItem: () => requestRecord ? JSON.stringify(requestRecord) : null, setItem() {} },
     crypto: { randomUUID: () => 'request-local' }, setTimeout, clearTimeout,
     el, inputField, button: (text, click, className, attrs = {}) => el('button', { ...attrs, className, onClick: click }, text),
     notice: (text, kind) => el('p', { className: `notice ${kind}` }, text), toast() {}, openDialog: () => ({ close() {} }),
     artworkEditor() {},
-    api: async () => ({ artworks: [] }),
+    api: async path => path.startsWith('/api/jobs/') ? { job: generation, user } : { artworks: [] },
     put: async (path, body) => {
       calls.push({ kind: 'put', path, body: structuredClone(body) });
       if (failSave) throw new Error('模拟保存失败');
@@ -208,7 +208,56 @@ test('学生算力用尽时仍无法生成，且显示联系管理员提示', as
 test('管理员无限算力也必须配置服务与确认计划', async t => {
   const user = { id: 'admin-local', role: 'admin', credits: 0 };
   const noConfig = workspace(t, { step: 5, confirmed: true, user, configured: false });
-  assert.equal(noConfig.root.querySelector('[data-generate]').disabled, true);
+  assert.equal(noConfig.root.querySelector('[data-generate]'), null);
   const unconfirmed = workspace(t, { step: 5, confirmed: false, user });
-  assert.equal(unconfirmed.root.querySelector('[data-generate]').disabled, true);
+  assert.equal(unconfirmed.root.querySelector('[data-generate]'), null);
+  assert.ok(unconfirmed.findButton('回到提炼创新'));
+});
+
+test('管理员未配置时集中显示算力、必要提醒和配置操作，不堆叠大按钮', t => {
+  const page = workspace(t, { step: 5, confirmed: true, configured: false, user: { id: 'admin-local', role: 'admin', credits: 0 } });
+  const body = page.root.querySelector('.generation-body');
+  assert.equal(body.querySelector('.step-intro'), null);
+  assert.equal(body.querySelector('.generation-balance').textContent, '本次生成 1 张管理员算力 无限');
+  const hint = body.querySelector('.generation-hint');
+  assert.match(hint.textContent, /个人信息/);
+  assert.match(hint.textContent, /计费/);
+  const config = body.querySelector('.generation-config');
+  assert.ok(config);
+  assert.match(config.textContent, /绘图服务尚未配置/);
+  assert.equal(body.querySelectorAll('.notice').length, 1);
+  assert.match(page.findButton('去后台配置绘图服务').attrs.class, /primary/);
+  assert.match(page.findButton('重新检查配置').attrs.class, /text-button/);
+  assert.equal(body.querySelector('[data-generate]'), null);
+});
+
+test('学生只显示必要的算力信息，未配置时等待管理员，配置后说明成功扣点', t => {
+  const page = workspace(t, { step: 5, confirmed: true, configured: false });
+  const body = page.root.querySelector('.generation-body');
+  assert.match(body.querySelector('.generation-balance').textContent, /本次生成 1 张剩余算力 10 点/);
+  assert.doesNotMatch(body.querySelector('.generation-balance').textContent, /预留/);
+  assert.match(body.querySelector('.generation-config').textContent, /等待管理员配置绘图服务/);
+  assert.equal(page.findButton('去后台配置绘图服务'), undefined);
+  assert.match(page.findButton('重新检查配置').attrs.class, /text-button/);
+  assert.equal(body.querySelector('[data-generate]'), null);
+  const reserved = workspace(t, { step: 5, confirmed: true, user: { id: 'student-local', role: 'student', credits: 10, available_credits: 9, reserved_credits: 1 } });
+  assert.match(reserved.root.querySelector('.generation-balance').textContent, /预留 1 点/);
+  assert.match(reserved.root.querySelector('[data-generate]').textContent, /成功消耗 1 点/);
+  const fullyReserved = workspace(t, { step: 5, confirmed: true, user: { id: 'student-local', role: 'student', credits: 1, available_credits: 0, reserved_credits: 1 } });
+  assert.match(fullyReserved.root.querySelector('.generation-body').textContent, /已全部预留/);
+  assert.equal(fullyReserved.root.querySelector('[data-generate]').disabled, true);
+});
+
+test('未完成的任务优先显示任务状态和核对入口，即使绘图服务未配置也不显示新的生成入口', t => {
+  for (const status of ['running', 'uncertain', 'requesting']) {
+    const requestRecord = { plan_id: 'plan-local', request_key: 'request-local', status, ...(status === 'requesting' ? {} : { job_id: 'job-local' }) };
+    const page = workspace(t, { step: 5, confirmed: true, configured: false, requestRecord, generation: { id: 'job-local', status } });
+    const body = page.root.querySelector('.generation-body');
+    assert.equal(body.querySelector('.generation-config'), null, status);
+    assert.equal(body.querySelector('[data-generate]'), null, status);
+    assert.equal(body.querySelectorAll('.notice').length, 1, status);
+    if (status === 'running') assert.match(body.textContent, /正在生成作品/);
+    if (status === 'uncertain') assert.ok(page.findButton('刷新核对状态'));
+    if (status === 'requesting') assert.ok(page.findButton('核对上次请求'));
+  }
 });

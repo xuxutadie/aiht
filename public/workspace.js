@@ -234,36 +234,45 @@ export function createWorkspace(initialPlan, ctx) {
   function generationContent() {
     const body = el('div', { className: 'step-card-body generation-body' });
     const balance = creditBalance(ctx.user);
-    body.append(el('p', { className: 'step-intro' }, balance.unlimited ? '每次生成 1 张图片。管理员拥有无限平台算力，生成时无需预留或扣除点数。' : STEPS[5].intro), el('div', { className: 'generation-balance' }, el('span', {}, '本次生成 ', el('strong', {}, '1 张')), el('span', {}, '剩余算力 ', el('strong', {}, balance.availableText)), el('span', {}, '预留 ', el('strong', {}, balance.reservedText))));
-    if (balance.exhausted) body.append(notice(`剩余算力为 0 点。${EXHAUSTED_MESSAGE}。你仍可以保存草稿、查看并下载已有作品。`, 'warning'));
-    else if (balance.fullyReserved) body.append(notice('当前算力已全部预留，请等待生成结果或联系老师核对。你仍可以保存草稿、查看并下载已有作品。', 'warning'));
-    if (!plan.confirmed) body.append(notice('你修改过创作计划，请回到第 5 步重新检查并确认。', 'error'), button('回到提炼创新', () => goStep(4), 'button secondary', { 'data-work-action': true }));
-    if (!ctx.configured) {
-      body.append(notice('绘图服务还没有配置。请联系老师；配置完成前，你可以继续完善计划并保存草稿。', 'info'));
-      if (ctx.user.role === 'admin') body.append(button('去后台配置绘图服务', ctx.onGoAdmin, 'button primary'));
-      body.append(button('重新检查配置', async event => {
-        const control = event.currentTarget; control.disabled = true;
-        try { const data = await api('/api/bootstrap'); ctx.configured = data.generation_configured; if (data.user) ctx.onUser(data.user); render(); if (!ctx.configured) toast('老师尚未配置绘图服务'); }
-        catch (err) { toast(err.message, true); } finally { control.disabled = false; }
-      }, 'button secondary'));
-    }
+    const isAdmin = ctx.user.role === 'admin';
+    body.append(el('div', { className: 'generation-balance' },
+      el('span', {}, '本次生成 ', el('strong', {}, '1 张')),
+      el('span', {}, balance.unlimited ? '管理员算力 ' : '剩余算力 ', el('strong', {}, balance.availableText)),
+      balance.reserved > 0 ? el('span', {}, '预留 ', el('strong', {}, balance.reservedText)) : null));
     const pendingWithoutJob = requestRecord?.status === 'requesting' && !requestRecord?.job_id;
     const active = job && ['queued', 'running'].includes(job.status);
-    if (pendingWithoutJob) body.append(notice('上次请求的结果尚未确定。请先核对，暂时不要发起新的生成。若核对失败，请联系老师查看任务，也可以到“我的作品”查看是否已保存图片。', 'warning'), button('核对上次请求（不会重复消耗算力）', () => startGeneration(true), 'button secondary', { 'data-work-action': true }));
+    if (pendingWithoutJob) body.append(notice('上次请求待核对，请勿重复生成。核对失败时，请联系管理员或查看“我的作品”。', 'warning'), button('核对上次请求（不会重复消耗算力）', () => startGeneration(true), 'button secondary', { 'data-work-action': true }));
     if (job) {
       // 任务结算模式与账户当前额度分开：更新前的管理员任务仍按原记录结算。
       const freeJob = job.unlimited_credits === true;
-      const text = { queued: '任务已排队，正在等待绘图。请勿重复提交。', running: '正在生成作品，图片完成后会自动保存在“我的作品”。', succeeded: freeJob ? '作品已生成并保存，本次不消耗算力。' : '作品已生成并保存，本次消耗 1 点算力。', failed: freeJob ? '本次生成未成功，不消耗算力。你可以检查计划后重试。' : '本次生成未成功，不消耗算力，预留的 1 点算力已释放。你可以检查计划后重试。', uncertain: freeJob ? '上游结果尚不确定，本任务不预留算力。请核对结果，核对完成前不要重复生成。' : '上游结果尚不确定，1 点算力暂时预留。请联系老师核对，核对完成前不要重复生成。', settled: '老师已核对这项任务。请到算力记录查看处理结果。' }[job.status] || '任务状态正在核对。';
-      body.append(notice(text, job.status === 'failed' ? 'error' : job.status === 'uncertain' ? 'warning' : job.status === 'succeeded' ? 'success' : 'info'));
+      const text = { queued: '任务已排队，请勿重复提交。', running: '正在生成作品，完成后自动保存。', succeeded: freeJob ? '作品已生成并保存，本次不消耗算力。' : '作品已生成并保存，本次消耗 1 点算力。', failed: freeJob ? '生成失败，不消耗算力，可检查计划后重试。' : '生成失败，预留的 1 点已释放，可检查计划后重试。', uncertain: freeJob ? '结果待核对，不预留算力。核对前请勿重复生成。' : '结果待核对，暂时预留 1 点。请联系管理员，勿重复生成。', settled: '任务已核对，请查看算力记录。' }[job.status] || '任务状态正在核对。';
+      if (active) body.append(el('div', { className: 'notice info job-progress', role: 'status' }, el('span', { className: 'progress-dot', 'aria-hidden': true }), text));
+      else body.append(notice(text, job.status === 'failed' ? 'error' : job.status === 'uncertain' ? 'warning' : job.status === 'succeeded' ? 'success' : 'info'));
       if (job.error_message) body.append(el('p', { className: 'muted' }, job.error_message));
-      if (active) body.append(el('div', { className: 'job-progress', role: 'status' }, el('span', { className: 'progress-dot', 'aria-hidden': true }), '正在等待绘图服务，请保留此页面…'));
       if (job.status === 'uncertain' || job.status === 'settled') body.append(button('刷新核对状态', pollJob, 'button secondary', { 'data-work-action': true }));
     }
     if (latestArtwork) body.append(el('figure', { className: 'generated-artwork' }, el('img', { src: `/api/artworks/${encodeURIComponent(latestArtwork.id)}/image`, alt: latestArtwork.title || '本次生成的作品' }), el('figcaption', {}, '对照计划看一看：画面表达了你的意思吗？')), el('div', { className: 'button-row' }, button('写作品说明', () => goStep(6), 'button primary', { 'data-work-action': true }), el('a', { className: 'button secondary', href: `/api/artworks/${encodeURIComponent(latestArtwork.id)}/download`, download: '' }, '下载原图')));
     const mayGenerate = !job || ['failed', 'succeeded', 'settled'].includes(job.status);
+    // 未完成任务优先展示核对状态；只有可以发起新任务时才提示下一项操作。
     if (!pendingWithoutJob && !active && mayGenerate) {
-      const action = job?.status === 'failed' ? '确认重试 1 张' : latestArtwork ? '再生成 1 张' : '确认生成 1 张';
-      body.append(button(`${action}（${balance.unlimited ? '不扣算力' : '成功消耗 1 点'}）`, () => startGeneration(false), 'button primary generation-submit', { disabled: !ctx.configured || !plan.confirmed || !balance.canGenerate, 'data-generate': true }));
+      if (balance.exhausted) body.append(notice(`算力已用完，${EXHAUSTED_MESSAGE}。`, 'warning'));
+      else if (balance.fullyReserved) body.append(notice('当前算力已全部预留，请等待结果或联系管理员核对。', 'warning'));
+      if (!plan.confirmed) body.append(notice('请先返回第 5 步确认创作计划。', 'error'), button('回到提炼创新', () => goStep(4), 'button secondary', { 'data-work-action': true }));
+      else if (!ctx.configured) {
+        body.append(el('div', { className: 'notice info generation-config' },
+          el('p', { role: 'status' }, el('strong', {}, isAdmin ? '绘图服务尚未配置' : '等待管理员配置绘图服务')),
+          el('div', { className: 'generation-config-actions' },
+            isAdmin ? button('去后台配置绘图服务', ctx.onGoAdmin, 'button primary') : null,
+            button('重新检查配置', async event => {
+              const control = event.currentTarget; control.disabled = true;
+              try { const data = await api('/api/bootstrap'); ctx.configured = data.generation_configured; if (data.user) ctx.onUser(data.user); render(); if (!ctx.configured) toast('绘图服务尚未配置'); }
+              catch (err) { toast(err.message, true); } finally { control.disabled = false; }
+            }, 'text-button'))));
+      } else {
+        const action = job?.status === 'failed' ? '确认重试 1 张' : latestArtwork ? '再生成 1 张' : '确认生成 1 张';
+        body.append(button(balance.unlimited ? action : `${action}（成功消耗 1 点）`, () => startGeneration(false), 'button primary generation-submit', { disabled: !balance.canGenerate, 'data-generate': true }));
+      }
+      body.append(el('p', { className: 'generation-hint' }, `提示词会发送给绘图服务，请勿包含个人信息。${isAdmin ? '模型按实际调用计费。' : ''}`));
     }
     return body;
   }

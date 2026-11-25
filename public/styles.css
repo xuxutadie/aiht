@@ -164,8 +164,14 @@ img { display: block; max-width: 100%; }
 .check-label { display: flex; align-items: flex-start; gap: 10px; min-height: 44px; cursor: pointer; font-size: 14px; line-height: 1.8; padding: 6px 0; }
 .check-label input { flex-shrink: 0; width: 20px; height: 20px; margin: 3px 0; accent-color: var(--blue); }
 .prompt-preview { display: flex; flex-direction: column; gap: 13px; border-top: 1px solid #d6aec5; padding-top: 20px; }
-.generation-balance { border: 2px solid var(--ink); background: var(--yellow-soft); border-radius: 12px; padding: 14px; display: flex; justify-content: space-around; gap: 12px; flex-wrap: wrap; }
+.step-card-body.generation-body { gap: 12px; }
+.generation-balance { border: 2px solid var(--ink); background: var(--yellow-soft); border-radius: 12px; padding: 12px 14px; display: flex; align-items: baseline; justify-content: space-around; gap: 8px 12px; flex-wrap: wrap; }
+.generation-balance span { white-space: nowrap; }
 .generation-balance strong { font-size: 22px; }
+.generation-config { display: flex; flex-direction: column; gap: 8px; }
+.generation-config-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; }
+.generation-config-actions .text-button { font-size: 13px; }
+.generation-hint { font-size: 13px; color: var(--muted); line-height: 1.6; }
 .generation-submit { font-size: 17px; min-height: 52px; }
 .generated-artwork { border: 2px solid var(--ink); border-radius: 12px; background: var(--white); overflow: hidden; }
 .generated-artwork img { width: 100%; max-height: 540px; object-fit: contain; }
